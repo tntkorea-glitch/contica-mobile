@@ -7,6 +7,7 @@ const PAGE_SIZE = 50;
 
 export default function ContactsScreen() {
   const [contacts, setContacts] = useState<Contact[]>([]);
+  const [total, setTotal] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -22,7 +23,7 @@ export default function ContactsScreen() {
 
     let q = supabase
       .from('contacts')
-      .select('*')
+      .select('*', reset ? { count: 'exact' } : undefined)
       .is('deleted_at', null)
       .order('last_name', { ascending: true })
       .order('first_name', { ascending: true })
@@ -33,7 +34,8 @@ export default function ContactsScreen() {
       q = q.or(`last_name.ilike.%${s}%,first_name.ilike.%${s}%,phone.ilike.%${s}%,email.ilike.%${s}%`);
     }
 
-    const { data, error } = await q;
+    const { data, error, count } = await q;
+    if (reset && typeof count === 'number') setTotal(count);
     if (error) {
       console.warn('contacts fetch error:', error.message);
       setLoading(false);
@@ -66,6 +68,9 @@ export default function ContactsScreen() {
 
   const listHeader = useMemo(() => (
     <View style={styles.header}>
+      <Text style={styles.totalText}>
+        {total !== null ? `${total.toLocaleString()}명의 연락처` : '연락처'}
+      </Text>
       <TextInput
         style={styles.search}
         placeholder="이름·전화·이메일 검색"
@@ -74,7 +79,7 @@ export default function ContactsScreen() {
         onChangeText={setSearch}
       />
     </View>
-  ), [search]);
+  ), [search, total]);
 
   if (loading) {
     return (
@@ -127,7 +132,8 @@ function ContactRow({ contact }: { contact: Contact }) {
 const styles = StyleSheet.create({
   center: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 40 },
   list: { flex: 1, backgroundColor: '#fff' },
-  header: { padding: 12, backgroundColor: '#fff', borderBottomWidth: 1, borderBottomColor: '#e5e7eb' },
+  header: { padding: 12, backgroundColor: '#fff', borderBottomWidth: 1, borderBottomColor: '#e5e7eb', gap: 8 },
+  totalText: { fontSize: 13, color: '#6b7280', fontWeight: '500' },
   search: { backgroundColor: '#f3f4f6', borderRadius: 10, padding: 10, fontSize: 14 },
   row: { flexDirection: 'row', alignItems: 'center', padding: 12, gap: 12, borderBottomWidth: 1, borderBottomColor: '#f3f4f6' },
   avatar: { width: 40, height: 40, borderRadius: 20, backgroundColor: '#6366f1', justifyContent: 'center', alignItems: 'center' },
