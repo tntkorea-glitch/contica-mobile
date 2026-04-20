@@ -68,33 +68,35 @@ export async function readAllPhoneContacts(): Promise<PhoneContact[]> {
 }
 
 async function fetchContactsByUser(uid: string): Promise<Contact[]> {
+  // count('exact') + RLS가 무거워서 타임아웃 + 502 발생.
+  // id 기준 keyset pagination으로 순차 페치 (인덱스 타고 빠름).
   const PAGE = 1000;
-  const CONCURRENT = 10;
-  const { count } = await supabase
-    .from('contacts')
-    .select('id', { count: 'exact', head: true })
-    .eq('user_id', uid)
-    .is('deleted_at', null);
-  if (!count) return [];
-  const pageCount = Math.ceil(count / PAGE);
   const all: Contact[] = [];
-  for (let i = 0; i < pageCount; i += CONCURRENT) {
-    const pages = Array.from({ length: Math.min(CONCURRENT, pageCount - i) }, (_, j) => i + j);
-    const results = await Promise.all(
-      pages.map(p =>
-        supabase
-          .from('contacts')
-          .select('*')
-          .eq('user_id', uid)
-          .is('deleted_at', null)
-          .range(p * PAGE, p * PAGE + PAGE - 1)
-      )
-    );
-    for (const r of results) {
-      if (r.error) throw r.error;
-      all.push(...((r.data ?? []) as Contact[]));
-    }
+  let lastId: string | null = null;
+  let safety = 0;
+
+  while (true) {
+    let q = supabase
+      .from('contacts')
+      .select('*')
+      .eq('user_id', uid)
+      .is('deleted_at', null)
+      .order('id', { ascending: true })
+      .limit(PAGE);
+    if (lastId) q = q.gt('id', lastId);
+
+    const { data, error } = await q;
+    if (error) throw error;
+    const rows = (data ?? []) as Contact[];
+    if (rows.length === 0) break;
+    all.push(...rows);
+    lastId = rows[rows.length - 1].id;
+    if (rows.length < PAGE) break;
+
+    safety++;
+    if (safety > 200) break;
   }
+  console.log(`[fetchContactsByUser] ${uid.slice(0, 8)} → ${all.length} rows`);
   return all;
 }
 
