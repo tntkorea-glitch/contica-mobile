@@ -81,7 +81,7 @@ class PhoneHistoryModule : Module() {
         projection,
         null,
         null,
-        "${CallLog.Calls.DATE} DESC LIMIT $effectiveLimit"
+        "${CallLog.Calls.DATE} DESC"
       )
 
       cursor?.use {
@@ -92,6 +92,7 @@ class PhoneHistoryModule : Module() {
         val durIdx = it.getColumnIndex(CallLog.Calls.DURATION)
 
         while (it.moveToNext()) {
+          if (results.size >= effectiveLimit) break
           val number = if (numberIdx >= 0) it.getString(numberIdx) else null
           if (number.isNullOrBlank()) continue
           val type = if (typeIdx >= 0) it.getInt(typeIdx) else 0
@@ -142,7 +143,7 @@ class PhoneHistoryModule : Module() {
         projection,
         null,
         null,
-        "${Telephony.Sms.DATE} DESC LIMIT $effectiveLimit"
+        "${Telephony.Sms.DATE} DESC"
       )
 
       cursor?.use {
@@ -152,6 +153,7 @@ class PhoneHistoryModule : Module() {
         val typeIdx = it.getColumnIndex(Telephony.Sms.TYPE)
 
         while (it.moveToNext()) {
+          if (results.size >= effectiveLimit) break
           val address = if (addressIdx >= 0) it.getString(addressIdx) else null
           if (address.isNullOrBlank()) continue
           val type = if (typeIdx >= 0) it.getInt(typeIdx) else 0
