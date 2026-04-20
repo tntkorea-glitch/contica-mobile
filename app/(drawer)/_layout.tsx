@@ -31,8 +31,9 @@ function CustomDrawerContent(props: DrawerContentComponentProps) {
 
   useEffect(() => {
     let alive = true;
-    (async () => {
-      const { data, error } = await supabase
+
+    const loadGroupsWithCounts = async () => {
+      const { data: gs, error } = await supabase
         .from('groups')
         .select('*')
         .is('deleted_at', null)
@@ -43,19 +44,38 @@ function CustomDrawerContent(props: DrawerContentComponentProps) {
         setGroups([]);
         return;
       }
-      setGroups((data ?? []) as Group[]);
-    })();
+      const rows = (gs ?? []) as Group[];
+      if (rows.length === 0) {
+        setGroups([]);
+        return;
+      }
+
+      const countMap = new Map<string, number>();
+      const PAGE = 1000;
+      let from = 0;
+      while (true) {
+        const { data: cgs } = await supabase
+          .from('contact_groups')
+          .select('group_id, contacts!inner(id, deleted_at)')
+          .is('contacts.deleted_at', null)
+          .range(from, from + PAGE - 1);
+        if (!cgs || cgs.length === 0) break;
+        for (const r of cgs as { group_id: string }[]) {
+          countMap.set(r.group_id, (countMap.get(r.group_id) ?? 0) + 1);
+        }
+        if (cgs.length < PAGE) break;
+        from += PAGE;
+      }
+      if (!alive) return;
+      setGroups(rows.map(g => ({ ...g, contact_count: countMap.get(g.id) ?? 0 })));
+    };
+
+    loadGroupsWithCounts();
 
     const channel = supabase
       .channel('drawer-groups-realtime')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'groups' }, async () => {
-        const { data } = await supabase
-          .from('groups')
-          .select('*')
-          .is('deleted_at', null)
-          .order('name', { ascending: true });
-        if (alive) setGroups((data ?? []) as Group[]);
-      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'groups' }, () => loadGroupsWithCounts())
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'contact_groups' }, () => loadGroupsWithCounts())
       .subscribe();
 
     return () => {
@@ -154,6 +174,9 @@ function CustomDrawerContent(props: DrawerContentComponentProps) {
                 <Text style={[styles.itemLabel, active && { fontWeight: '600', color: '#111827' }]} numberOfLines={1}>
                   {g.name}
                 </Text>
+                {typeof g.contact_count === 'number' ? (
+                  <Text style={styles.groupCount}>{g.contact_count.toLocaleString()}</Text>
+                ) : null}
               </Pressable>
             );
           })
@@ -195,6 +218,7 @@ const styles = StyleSheet.create({
   itemIcon: { width: 18, textAlign: 'center' },
   itemLabel: { fontSize: 14, color: '#374151', flex: 1 },
   groupDot: { width: 10, height: 10, borderRadius: 5 },
+  groupCount: { fontSize: 11, color: '#9ca3af', fontWeight: '500', marginLeft: 4 },
   divider: { height: 1, backgroundColor: '#f3f4f6', marginVertical: 4 },
   emptyText: { fontSize: 12, color: '#9ca3af', padding: 14, textAlign: 'center' },
 });
