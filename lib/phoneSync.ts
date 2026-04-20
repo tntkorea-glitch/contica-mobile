@@ -69,34 +69,34 @@ export async function readAllPhoneContacts(): Promise<PhoneContact[]> {
 
 async function readAllServerContacts(_userId: string): Promise<Contact[]> {
   // RLS에서 본인 소유 + 공유받은 메인 계정 contacts를 자동으로 포함.
-  // 여기선 user_id 필터를 걸지 않아서 공유 데이터도 함께 읽음.
+  // count('exact')는 공유 정책으로 인한 subquery 때문에 느릴 수 있어서,
+  // id 기준 keyset pagination으로 순차 페치 (커서 기반, 빠름).
   const PAGE = 1000;
-  const CONCURRENT = 10;
-  const { count, error: countErr } = await supabase
-    .from('contacts')
-    .select('id', { count: 'exact', head: true })
-    .is('deleted_at', null);
-  if (countErr) throw countErr;
-  if (!count) return [];
-  const pageCount = Math.ceil(count / PAGE);
   const all: Contact[] = [];
-  for (let i = 0; i < pageCount; i += CONCURRENT) {
-    const pages = Array.from(
-      { length: Math.min(CONCURRENT, pageCount - i) },
-      (_, j) => i + j
-    );
-    const results = await Promise.all(
-      pages.map(p =>
-        supabase
-          .from('contacts')
-          .select('*')
-          .is('deleted_at', null)
-          .range(p * PAGE, p * PAGE + PAGE - 1)
-      )
-    );
-    for (const r of results) {
-      if (r.error) throw r.error;
-      all.push(...((r.data ?? []) as Contact[]));
+  let lastId: string | null = null;
+  let safety = 0;
+
+  while (true) {
+    let q = supabase
+      .from('contacts')
+      .select('*')
+      .is('deleted_at', null)
+      .order('id', { ascending: true })
+      .limit(PAGE);
+    if (lastId) q = q.gt('id', lastId);
+
+    const { data, error } = await q;
+    if (error) throw error;
+    const rows = (data ?? []) as Contact[];
+    if (rows.length === 0) break;
+    all.push(...rows);
+    lastId = rows[rows.length - 1].id;
+    if (rows.length < PAGE) break;
+
+    safety++;
+    if (safety > 200) {
+      console.warn('[readAllServerContacts] safety break at', all.length);
+      break;
     }
   }
   return all;
@@ -202,11 +202,10 @@ export async function syncAppToPhone(userId: string, onProgress?: ProgressHandle
   const granted = await ensurePermission();
   if (!granted) throw new Error('연락처 접근 권한이 거부되었습니다.');
 
-  onProgress?.({ phase: 'phone-read', done: 0, total: 0, message: '폰·서버 연락처 읽는 중...' });
-  const [phoneContacts, serverContacts] = await Promise.all([
-    readAllPhoneContacts(),
-    readAllServerContacts(userId),
-  ]);
+  onProgress?.({ phase: 'phone-read', done: 0, total: 0, message: '폰 연락처 읽는 중...' });
+  const phoneContacts = await readAllPhoneContacts();
+  onProgress?.({ phase: 'phone-read', done: phoneContacts.length, total: 0, message: `서버 연락처 읽는 중... (폰 ${phoneContacts.length}건 완료)` });
+  const serverContacts = await readAllServerContacts(userId);
 
   const phoneById = new Map<string, PhoneContact>();
   const phoneByKey = new Map<string, PhoneContact>();
@@ -404,11 +403,10 @@ export async function syncPhoneToApp(userId: string, onProgress?: ProgressHandle
   const granted = await ensurePermission();
   if (!granted) throw new Error('연락처 접근 권한이 거부되었습니다.');
 
-  onProgress?.({ phase: 'phone-read', done: 0, total: 0, message: '폰·서버 연락처 읽는 중...' });
-  const [phoneContacts, serverContacts] = await Promise.all([
-    readAllPhoneContacts(),
-    readAllServerContacts(userId),
-  ]);
+  onProgress?.({ phase: 'phone-read', done: 0, total: 0, message: '폰 연락처 읽는 중...' });
+  const phoneContacts = await readAllPhoneContacts();
+  onProgress?.({ phase: 'phone-read', done: phoneContacts.length, total: 0, message: `서버 연락처 읽는 중... (폰 ${phoneContacts.length}건 완료)` });
+  const serverContacts = await readAllServerContacts(userId);
 
   const serverByPhoneId = new Map<string, Contact>();
   const serverByKey = new Map<string, Contact>();
