@@ -1,6 +1,7 @@
 import * as Contacts from 'expo-contacts';
 import { supabase } from './supabase';
 import type { Contact } from './types';
+import { addContactsBatch, isBatchAvailable, type BatchContact } from '../modules/contacts-batch/src';
 
 export type PhoneContact = Contacts.ExistingContact;
 
@@ -296,37 +297,86 @@ export async function syncAppToPhone(userId: string, onProgress?: ProgressHandle
     });
   }
 
-  // 추가 병렬
-  for (let i = 0; i < addTasks.length; i += CONCURRENT) {
-    const chunk = addTasks.slice(i, i + CONCURRENT);
-    const results = await Promise.all(chunk.map(async t => {
+  // 추가: 네이티브 배치 모듈이 있으면 배치, 없으면 병렬 개별 호출
+  if (isBatchAvailable() && addTasks.length > 0) {
+    const BATCH = 500;
+    for (let i = 0; i < addTasks.length; i += BATCH) {
+      const slice = addTasks.slice(i, i + BATCH);
+      const batchPayload: BatchContact[] = slice.map(t => ({
+        firstName: t.server.first_name ?? '',
+        lastName: t.server.last_name ?? '',
+        phoneNumbers: [
+          t.server.phone ? { label: 'mobile', number: t.server.phone } : null,
+          t.server.phone2 ? { label: 'work', number: t.server.phone2 } : null,
+        ].filter(Boolean) as BatchContact['phoneNumbers'],
+        emails: [
+          t.server.email ? { label: 'home', email: t.server.email } : null,
+          t.server.email2 ? { label: 'work', email: t.server.email2 } : null,
+        ].filter(Boolean) as BatchContact['emails'],
+        company: t.server.company ?? undefined,
+        jobTitle: t.server.position ?? undefined,
+      }));
       try {
-        const newId = await Contacts.addContactAsync(t.payload);
-        markPhoneIdSkippable(newId);
-        return { ok: true as const, server: t.server, newId };
-      } catch (e) {
-        return { ok: false as const, server: t.server, error: e as Error };
-      }
-    }));
-    for (const r of results) {
-      if (r.ok) {
-        linkUpdates.push({ id: r.server.id, phone_contact_id: r.newId });
-        added++;
-        if (linkUpdates.length >= 500) {
-          await flushLinkUpdates(linkUpdates);
-          linkUpdates.length = 0;
+        const ids = await addContactsBatch(batchPayload);
+        for (let k = 0; k < slice.length; k++) {
+          const newId = ids[k];
+          const server = slice[k].server;
+          if (newId && newId !== '') {
+            markPhoneIdSkippable(newId);
+            linkUpdates.push({ id: server.id, phone_contact_id: newId });
+            added++;
+          } else {
+            errors++;
+            if (errorLogCount++ < 3) console.warn('[app→phone batch]', server.id, 'empty id');
+          }
         }
-      } else {
-        errors++;
-        if (errorLogCount++ < 3) console.warn('[app→phone add]', r.server.id, r.error.message, JSON.stringify(r.server).slice(0, 200));
+      } catch (e) {
+        errors += slice.length;
+        if (errorLogCount++ < 3) console.warn('[app→phone batch chunk]', (e as Error).message);
       }
+      if (linkUpdates.length >= 500) {
+        await flushLinkUpdates(linkUpdates);
+        linkUpdates.length = 0;
+      }
+      onProgress?.({
+        phase: 'app-to-phone',
+        done: updateTasks.length + Math.min(addTasks.length, i + BATCH),
+        total: updateTasks.length + addTasks.length,
+        message: `배치 추가 중... ${Math.min(addTasks.length, i + BATCH)}/${addTasks.length}`,
+      });
     }
-    onProgress?.({
-      phase: 'app-to-phone',
-      done: updateTasks.length + Math.min(addTasks.length, i + CONCURRENT),
-      total: updateTasks.length + addTasks.length,
-      message: `폰에 추가 중... ${Math.min(addTasks.length, i + CONCURRENT)}/${addTasks.length}`,
-    });
+  } else {
+    for (let i = 0; i < addTasks.length; i += CONCURRENT) {
+      const chunk = addTasks.slice(i, i + CONCURRENT);
+      const results = await Promise.all(chunk.map(async t => {
+        try {
+          const newId = await Contacts.addContactAsync(t.payload);
+          markPhoneIdSkippable(newId);
+          return { ok: true as const, server: t.server, newId };
+        } catch (e) {
+          return { ok: false as const, server: t.server, error: e as Error };
+        }
+      }));
+      for (const r of results) {
+        if (r.ok) {
+          linkUpdates.push({ id: r.server.id, phone_contact_id: r.newId });
+          added++;
+          if (linkUpdates.length >= 500) {
+            await flushLinkUpdates(linkUpdates);
+            linkUpdates.length = 0;
+          }
+        } else {
+          errors++;
+          if (errorLogCount++ < 3) console.warn('[app→phone add]', r.server.id, r.error.message, JSON.stringify(r.server).slice(0, 200));
+        }
+      }
+      onProgress?.({
+        phase: 'app-to-phone',
+        done: updateTasks.length + Math.min(addTasks.length, i + CONCURRENT),
+        total: updateTasks.length + addTasks.length,
+        message: `폰에 추가 중... ${Math.min(addTasks.length, i + CONCURRENT)}/${addTasks.length}`,
+      });
+    }
   }
 
   if (linkUpdates.length) await flushLinkUpdates(linkUpdates);

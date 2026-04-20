@@ -32,7 +32,13 @@
       "favicon": "./assets/images/favicon.png"
     },
     "plugins": [
-      "expo-router"
+      "expo-router",
+      [
+        "expo-contacts",
+        {
+          "contactsPermission": "Contica가 연락처를 읽고 쓸 수 있도록 허용해 주세요."
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true

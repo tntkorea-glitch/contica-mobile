@@ -1,0 +1,7 @@
+{
+  "name": "contacts-batch",
+  "version": "0.1.0",
+  "description": "Local Expo module: batch insert contacts on Android via ContentResolver.applyBatch",
+  "main": "src/index.ts",
+  "private": true
+}
