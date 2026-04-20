@@ -68,14 +68,15 @@ export async function readAllPhoneContacts(): Promise<PhoneContact[]> {
 }
 
 async function fetchContactsByUser(uid: string): Promise<Contact[]> {
-  // count('exact') + RLS가 무거워서 타임아웃 + 502 발생.
-  // id 기준 keyset pagination으로 순차 페치 (인덱스 타고 빠름).
+  const prefix = uid.slice(0, 8);
+  console.log(`[fetch ${prefix}] start`);
   const PAGE = 1000;
   const all: Contact[] = [];
   let lastId: string | null = null;
   let safety = 0;
 
   while (true) {
+    const t0 = Date.now();
     let q = supabase
       .from('contacts')
       .select('*')
@@ -85,9 +86,20 @@ async function fetchContactsByUser(uid: string): Promise<Contact[]> {
       .limit(PAGE);
     if (lastId) q = q.gt('id', lastId);
 
-    const { data, error } = await q;
-    if (error) throw error;
-    const rows = (data ?? []) as Contact[];
+    const result = await Promise.race([
+      q,
+      new Promise<{ data: null; error: Error }>((_, rej) =>
+        setTimeout(() => rej(new Error(`timeout after 20s page=${safety}`)), 20_000)
+      ),
+    ]) as Awaited<ReturnType<typeof q>>;
+
+    const ms = Date.now() - t0;
+    if (result.error) {
+      console.warn(`[fetch ${prefix}] page ${safety} error (${ms}ms):`, result.error.message);
+      throw result.error;
+    }
+    const rows = (result.data ?? []) as Contact[];
+    console.log(`[fetch ${prefix}] page ${safety} ${rows.length} rows (${ms}ms)`);
     if (rows.length === 0) break;
     all.push(...rows);
     lastId = rows[rows.length - 1].id;
@@ -96,22 +108,26 @@ async function fetchContactsByUser(uid: string): Promise<Contact[]> {
     safety++;
     if (safety > 200) break;
   }
-  console.log(`[fetchContactsByUser] ${uid.slice(0, 8)} → ${all.length} rows`);
+  console.log(`[fetch ${prefix}] done → ${all.length} rows`);
   return all;
 }
 
 async function readAllServerContacts(userId: string): Promise<Contact[]> {
-  // 본인 소유 + 공유받은 메인 계정 각각 user_id로 병렬 페치.
-  // RLS의 OR 조건 subquery를 피해 단순 eq로 인덱스 직타.
-  const { data: shares } = await supabase
+  console.log(`[readAll] start, auth user=${userId.slice(0, 8)}`);
+  const { data: shares, error: shErr } = await supabase
     .from('user_shares')
     .select('main_user_id')
     .eq('member_user_id', userId)
     .eq('scope', 'all')
     .is('revoked_at', null);
+  if (shErr) console.warn('[readAll] shares error:', shErr.message);
 
-  const targetIds = [userId, ...((shares ?? []).map(s => s.main_user_id as string))];
+  const shareIds = (shares ?? []).map(s => s.main_user_id as string);
+  console.log(`[readAll] shares lookup → ${shareIds.length} mains`);
+  const targetIds = [userId, ...shareIds];
   const results = await Promise.all(targetIds.map(uid => fetchContactsByUser(uid)));
+  const total = results.reduce((a, b) => a + b.length, 0);
+  console.log(`[readAll] done → ${total} total rows`);
   return results.flat();
 }
 
