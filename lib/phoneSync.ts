@@ -339,7 +339,9 @@ export async function syncAppToPhone(userId: string, onProgress?: ProgressHandle
 
   // 추가: 네이티브 배치 모듈이 있으면 배치, 없으면 병렬 개별 호출
   if (isBatchAvailable() && addTasks.length > 0) {
-    const BATCH = 500;
+    // Android ContentProvider는 applyBatch 당 500 ops 제한.
+    // contact 1개 = 최대 7 ops → 60 × 7 = 420 ops (안전마진).
+    const BATCH = 60;
     for (let i = 0; i < addTasks.length; i += BATCH) {
       const slice = addTasks.slice(i, i + BATCH);
       const batchPayload: BatchContact[] = slice.map(t => ({
