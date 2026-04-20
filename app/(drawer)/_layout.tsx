@@ -102,6 +102,25 @@ function CustomDrawerContent(props: DrawerContentComponentProps) {
 
       <View style={styles.divider} />
 
+      <View style={styles.section}>
+        <Pressable
+          onPress={() => {
+            router.push('/sync');
+            props.navigation.closeDrawer();
+          }}
+          style={styles.item}
+        >
+          <FontAwesome name="refresh" size={16} color="#0ea5e9" style={styles.itemIcon} />
+          <Text style={[styles.itemLabel, { color: '#0ea5e9', fontWeight: '600' }]}>폰 동기화</Text>
+        </Pressable>
+        <Pressable onPress={signOut} style={styles.item}>
+          <FontAwesome name="sign-out" size={16} color="#ef4444" style={styles.itemIcon} />
+          <Text style={[styles.itemLabel, { color: '#ef4444' }]}>로그아웃</Text>
+        </Pressable>
+      </View>
+
+      <View style={styles.divider} />
+
       <View style={styles.sectionHeaderWrap}>
         <Text style={styles.sectionHeader}>그룹</Text>
       </View>
@@ -129,25 +148,6 @@ function CustomDrawerContent(props: DrawerContentComponentProps) {
             );
           })
         )}
-      </View>
-
-      <View style={styles.divider} />
-
-      <View style={styles.section}>
-        <Pressable
-          onPress={() => {
-            router.push('/sync');
-            props.navigation.closeDrawer();
-          }}
-          style={styles.item}
-        >
-          <FontAwesome name="refresh" size={16} color="#0ea5e9" style={styles.itemIcon} />
-          <Text style={[styles.itemLabel, { color: '#0ea5e9', fontWeight: '600' }]}>폰 동기화</Text>
-        </Pressable>
-        <Pressable onPress={signOut} style={styles.item}>
-          <FontAwesome name="sign-out" size={16} color="#ef4444" style={styles.itemIcon} />
-          <Text style={[styles.itemLabel, { color: '#ef4444' }]}>로그아웃</Text>
-        </Pressable>
       </View>
     </DrawerContentScrollView>
   );
