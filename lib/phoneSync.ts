@@ -67,21 +67,36 @@ export async function readAllPhoneContacts(): Promise<PhoneContact[]> {
 }
 
 async function readAllServerContacts(userId: string): Promise<Contact[]> {
-  const all: Contact[] = [];
   const PAGE = 1000;
-  let from = 0;
-  while (true) {
-    const { data, error } = await supabase
-      .from('contacts')
-      .select('*')
-      .eq('user_id', userId)
-      .is('deleted_at', null)
-      .range(from, from + PAGE - 1);
-    if (error) throw error;
-    const rows = (data ?? []) as Contact[];
-    all.push(...rows);
-    if (rows.length < PAGE) break;
-    from += PAGE;
+  const CONCURRENT = 10;
+  const { count, error: countErr } = await supabase
+    .from('contacts')
+    .select('id', { count: 'exact', head: true })
+    .eq('user_id', userId)
+    .is('deleted_at', null);
+  if (countErr) throw countErr;
+  if (!count) return [];
+  const pageCount = Math.ceil(count / PAGE);
+  const all: Contact[] = [];
+  for (let i = 0; i < pageCount; i += CONCURRENT) {
+    const pages = Array.from(
+      { length: Math.min(CONCURRENT, pageCount - i) },
+      (_, j) => i + j
+    );
+    const results = await Promise.all(
+      pages.map(p =>
+        supabase
+          .from('contacts')
+          .select('*')
+          .eq('user_id', userId)
+          .is('deleted_at', null)
+          .range(p * PAGE, p * PAGE + PAGE - 1)
+      )
+    );
+    for (const r of results) {
+      if (r.error) throw r.error;
+      all.push(...((r.data ?? []) as Contact[]));
+    }
   }
   return all;
 }
@@ -238,9 +253,12 @@ export async function syncAppToPhone(userId: string, onProgress?: ProgressHandle
 }
 
 async function flushLinkUpdates(updates: { id: string; phone_contact_id: string }[]) {
-  for (const u of updates) {
-    const { error } = await supabase.from('contacts').update({ phone_contact_id: u.phone_contact_id }).eq('id', u.id);
-    if (error) console.warn('[link update]', error.message);
+  if (!updates.length) return;
+  const BULK = 500;
+  for (let i = 0; i < updates.length; i += BULK) {
+    const slice = updates.slice(i, i + BULK);
+    const { error } = await supabase.from('contacts').upsert(slice, { onConflict: 'id' });
+    if (error) console.warn('[link bulk-upsert]', error.message);
   }
 }
 
@@ -264,14 +282,14 @@ export async function syncPhoneToApp(userId: string, onProgress?: ProgressHandle
   }
 
   const total = phoneContacts.length;
-  let done = 0;
-  let inserted = 0;
-  let updated = 0;
-  let errors = 0;
   const toInsert: ReturnType<typeof phoneToServerPayload>[] = [];
+  const toUpsert: Array<Record<string, unknown>> = [];
+  let errors = 0;
+  let diffed = 0;
+  const fields: (keyof Contact)[] = ['first_name', 'last_name', 'phone', 'phone2', 'email', 'email2', 'company', 'position', 'address', 'memo'];
 
   for (const p of phoneContacts) {
-    done++;
+    diffed++;
     if (!p.id) continue;
     try {
       let existing = serverByPhoneId.get(p.id);
@@ -287,12 +305,11 @@ export async function syncPhoneToApp(userId: string, onProgress?: ProgressHandle
       const payload = phoneToServerPayload(p, userId);
 
       if (existing) {
-        const updates: Record<string, unknown> = {};
-        if (existing.phone_contact_id !== p.id) updates.phone_contact_id = p.id;
-        const fields: (keyof Contact)[] = ['first_name', 'last_name', 'phone', 'phone2', 'email', 'email2', 'company', 'position', 'address', 'memo'];
+        const updates: Record<string, unknown> = { id: existing.id };
+        let changed = false;
+        if (existing.phone_contact_id !== p.id) { updates.phone_contact_id = p.id; changed = true; }
         const payloadRec = payload as unknown as Record<string, unknown>;
         const existingRec = existing as unknown as Record<string, unknown>;
-        let changed = !!updates.phone_contact_id;
         for (const f of fields) {
           const newVal = payloadRec[f] ?? null;
           const oldVal = existingRec[f] ?? null;
@@ -301,43 +318,74 @@ export async function syncPhoneToApp(userId: string, onProgress?: ProgressHandle
             changed = true;
           }
         }
-        if (changed) {
-          const { error } = await supabase.from('contacts').update(updates).eq('id', existing.id);
-          if (error) throw error;
-          updated++;
-        }
+        if (changed) toUpsert.push(updates);
       } else {
         toInsert.push(payload);
       }
     } catch (e) {
       errors++;
-      if (errors <= 5) console.warn('[phone→app]', p.id, (e as Error).message);
+      if (errors <= 5) console.warn('[phone→app diff]', p.id, (e as Error).message);
     }
 
-    if (toInsert.length >= 500) {
-      const { error } = await supabase.from('contacts').insert(toInsert);
-      if (error) console.warn('[bulk insert]', error.message);
-      else inserted += toInsert.length;
-      toInsert.length = 0;
-    }
-
-    if (done % 50 === 0 || done === total) {
-      onProgress?.({ phase: 'phone-to-app', done, total, message: `서버에 반영 중... ${done}/${total}` });
+    if (diffed % 500 === 0 || diffed === total) {
+      onProgress?.({ phase: 'phone-to-app', done: diffed, total, message: `비교 중... ${diffed}/${total}` });
     }
   }
 
-  if (toInsert.length) {
-    const { error } = await supabase.from('contacts').insert(toInsert);
-    if (error) console.warn('[bulk insert]', error.message);
-    else inserted += toInsert.length;
+  // Bulk insert in chunks of 500 (parallel up to 5)
+  let inserted = 0;
+  const BULK = 500;
+  const INSERT_CONC = 5;
+  for (let i = 0; i < toInsert.length; i += BULK * INSERT_CONC) {
+    const chunkRuns = [];
+    for (let j = 0; j < INSERT_CONC && i + j * BULK < toInsert.length; j++) {
+      const slice = toInsert.slice(i + j * BULK, i + j * BULK + BULK);
+      if (slice.length) {
+        chunkRuns.push(
+          supabase.from('contacts').insert(slice).then(r => {
+            if (r.error) console.warn('[bulk insert]', r.error.message);
+            else inserted += slice.length;
+          })
+        );
+      }
+    }
+    await Promise.all(chunkRuns);
+    onProgress?.({ phase: 'phone-to-app', done: Math.min(toInsert.length, i + BULK * INSERT_CONC), total: toInsert.length, message: `신규 반영... ${Math.min(toInsert.length, i + BULK * INSERT_CONC)}/${toInsert.length}` });
   }
 
+  // Bulk UPSERT (by id) in chunks of 500 — replaces individual updates
+  let updated = 0;
+  for (let i = 0; i < toUpsert.length; i += BULK * INSERT_CONC) {
+    const chunkRuns = [];
+    for (let j = 0; j < INSERT_CONC && i + j * BULK < toUpsert.length; j++) {
+      const slice = toUpsert.slice(i + j * BULK, i + j * BULK + BULK);
+      if (slice.length) {
+        chunkRuns.push(
+          supabase.from('contacts').upsert(slice, { onConflict: 'id' }).then(r => {
+            if (r.error) console.warn('[bulk upsert]', r.error.message);
+            else updated += slice.length;
+          })
+        );
+      }
+    }
+    await Promise.all(chunkRuns);
+    onProgress?.({ phase: 'phone-to-app', done: Math.min(toUpsert.length, i + BULK * INSERT_CONC), total: toUpsert.length, message: `수정 반영... ${Math.min(toUpsert.length, i + BULK * INSERT_CONC)}/${toUpsert.length}` });
+  }
+
+  // Bulk soft delete — one request with IN clause
   const phoneIds = new Set<string>(phoneContacts.map(p => p.id ?? '').filter(Boolean));
-  const toSoftDelete = serverContacts.filter(c => c.phone_contact_id && !phoneIds.has(c.phone_contact_id));
+  const toSoftDeleteIds = serverContacts.filter(c => c.phone_contact_id && !phoneIds.has(c.phone_contact_id)).map(c => c.id);
   let softDeleted = 0;
-  for (const c of toSoftDelete) {
-    const { error } = await supabase.from('contacts').update({ deleted_at: new Date().toISOString() }).eq('id', c.id);
-    if (!error) softDeleted++;
+  if (toSoftDeleteIds.length) {
+    for (let i = 0; i < toSoftDeleteIds.length; i += 1000) {
+      const slice = toSoftDeleteIds.slice(i, i + 1000);
+      const { error } = await supabase
+        .from('contacts')
+        .update({ deleted_at: new Date().toISOString() })
+        .in('id', slice);
+      if (!error) softDeleted += slice.length;
+      else console.warn('[bulk soft-delete]', error.message);
+    }
   }
 
   onProgress?.({ phase: 'done', done: total, total, message: `완료: 신규 +${inserted} / 수정 ${updated} / 휴지통 ${softDeleted} / 실패 ${errors}` });
