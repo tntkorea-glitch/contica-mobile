@@ -60,7 +60,7 @@ export default function SyncScreen() {
               setLastResult(
                 `양방향 완료\n`
                 + `폰→앱: 신규 +${r.phoneToApp.inserted} / 수정 ${r.phoneToApp.updated} / 휴지통 ${r.phoneToApp.softDeleted} / 실패 ${r.phoneToApp.errors}\n`
-                + `앱→폰: 신규 +${r.appToPhone.added} / 수정 ${r.appToPhone.updated} / 실패 ${r.appToPhone.errors}`
+                + `앱→폰: 신규 +${r.appToPhone.added} / 수정 ${r.appToPhone.updated} / 스킵 ${r.appToPhone.skipped} / 실패 ${r.appToPhone.errors}`
               );
               await refreshStats();
             } catch (e) {

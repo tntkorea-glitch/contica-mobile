@@ -182,7 +182,22 @@ function phoneToServerPayload(p: PhoneContact, userId: string): Partial<Contact>
   };
 }
 
-export async function syncAppToPhone(userId: string, onProgress?: ProgressHandler): Promise<{ added: number; updated: number; errors: number }> {
+function phoneDataMatches(server: Contact, phone: PhoneContact): boolean {
+  const normalize = (s: string | undefined | null) => (s ?? '').replace(/\D/g, '');
+  const serverFirst = (server.first_name ?? '').trim();
+  const serverLast = (server.last_name ?? '').trim();
+  const phoneFirst = (phone.firstName ?? '').trim();
+  const phoneLast = (phone.lastName ?? '').trim();
+  const serverPhone = normalize(server.phone);
+  const phoneFirstNumber = normalize(phone.phoneNumbers?.[0]?.number);
+  return (
+    serverFirst === phoneFirst &&
+    serverLast === phoneLast &&
+    serverPhone === phoneFirstNumber
+  );
+}
+
+export async function syncAppToPhone(userId: string, onProgress?: ProgressHandler): Promise<{ added: number; updated: number; skipped: number; errors: number }> {
   const granted = await ensurePermission();
   if (!granted) throw new Error('연락처 접근 권한이 거부되었습니다.');
 
@@ -202,60 +217,122 @@ export async function syncAppToPhone(userId: string, onProgress?: ProgressHandle
     }
   }
 
-  const total = serverContacts.length;
-  let done = 0;
+  type AddTask = { server: Contact; payload: Contacts.Contact };
+  type UpdateTask = { server: Contact; phoneId: string; payload: { id: string } & Partial<Contacts.ExistingContact> };
+  const addTasks: AddTask[] = [];
+  const updateTasks: UpdateTask[] = [];
+  const linkUpdates: { id: string; phone_contact_id: string }[] = [];
+  let skipped = 0;
+
+  for (const c of serverContacts) {
+    let phone = c.phone_contact_id ? phoneById.get(c.phone_contact_id) : undefined;
+    if (!phone) {
+      const keys = [phoneKey(c.phone), phoneKey(c.phone2)].filter(Boolean);
+      for (const k of keys) {
+        const p = phoneByKey.get(k);
+        if (p) { phone = p; break; }
+      }
+    }
+
+    if (phone?.id) {
+      if (phoneDataMatches(c, phone)) {
+        // 이미 동일 — 폰 쓰기 스킵. 링크만 필요시 업데이트.
+        if (!c.phone_contact_id) linkUpdates.push({ id: c.id, phone_contact_id: phone.id });
+        skipped++;
+        continue;
+      }
+      const payload = contactToPhonePayload(c);
+      updateTasks.push({
+        server: c,
+        phoneId: phone.id,
+        payload: { id: phone.id, ...payload } as { id: string } & Partial<Contacts.ExistingContact>,
+      });
+    } else {
+      addTasks.push({ server: c, payload: contactToPhonePayload(c) });
+    }
+  }
+
+  // 링크만 필요한 건 먼저 bulk upsert
+  if (linkUpdates.length) {
+    await flushLinkUpdates(linkUpdates);
+    linkUpdates.length = 0;
+  }
+
+  const CONCURRENT = 10;
   let added = 0;
   let updated = 0;
   let errors = 0;
-  const linkUpdates: { id: string; phone_contact_id: string }[] = [];
+  let errorLogCount = 0;
 
-  for (const c of serverContacts) {
-    done++;
-    try {
-      let phone = c.phone_contact_id ? phoneById.get(c.phone_contact_id) : undefined;
-      if (!phone) {
-        const keys = [phoneKey(c.phone), phoneKey(c.phone2)].filter(Boolean);
-        for (const k of keys) {
-          const p = phoneByKey.get(k);
-          if (p) { phone = p; break; }
-        }
+  // 업데이트 병렬
+  for (let i = 0; i < updateTasks.length; i += CONCURRENT) {
+    const chunk = updateTasks.slice(i, i + CONCURRENT);
+    const results = await Promise.all(chunk.map(async t => {
+      try {
+        await Contacts.updateContactAsync(t.payload);
+        markPhoneIdSkippable(t.phoneId);
+        return { ok: true as const, server: t.server };
+      } catch (e) {
+        return { ok: false as const, server: t.server, error: e as Error };
       }
-
-      const payload = contactToPhonePayload(c);
-
-      if (phone?.id) {
-        await Contacts.updateContactAsync({ id: phone.id, ...payload } as { id: string } & Partial<Contacts.ExistingContact>);
-        markPhoneIdSkippable(phone.id);
-        if (!c.phone_contact_id) linkUpdates.push({ id: c.id, phone_contact_id: phone.id });
+    }));
+    for (const r of results) {
+      if (r.ok) {
+        if (!r.server.phone_contact_id) {
+          const phone = phoneById.get(r.server.phone_contact_id ?? '') ?? undefined;
+          if (phone?.id) linkUpdates.push({ id: r.server.id, phone_contact_id: phone.id });
+        }
         updated++;
       } else {
-        const newId = await Contacts.addContactAsync(payload as Contacts.Contact);
+        errors++;
+        if (errorLogCount++ < 3) console.warn('[app→phone update]', r.server.id, r.error.message);
+      }
+    }
+    onProgress?.({
+      phase: 'app-to-phone',
+      done: Math.min(updateTasks.length, i + CONCURRENT),
+      total: updateTasks.length + addTasks.length,
+      message: `폰 수정 중... ${Math.min(updateTasks.length, i + CONCURRENT)}/${updateTasks.length}`,
+    });
+  }
+
+  // 추가 병렬
+  for (let i = 0; i < addTasks.length; i += CONCURRENT) {
+    const chunk = addTasks.slice(i, i + CONCURRENT);
+    const results = await Promise.all(chunk.map(async t => {
+      try {
+        const newId = await Contacts.addContactAsync(t.payload);
         markPhoneIdSkippable(newId);
-        linkUpdates.push({ id: c.id, phone_contact_id: newId });
+        return { ok: true as const, server: t.server, newId };
+      } catch (e) {
+        return { ok: false as const, server: t.server, error: e as Error };
+      }
+    }));
+    for (const r of results) {
+      if (r.ok) {
+        linkUpdates.push({ id: r.server.id, phone_contact_id: r.newId });
         added++;
+        if (linkUpdates.length >= 500) {
+          await flushLinkUpdates(linkUpdates);
+          linkUpdates.length = 0;
+        }
+      } else {
+        errors++;
+        if (errorLogCount++ < 3) console.warn('[app→phone add]', r.server.id, r.error.message, JSON.stringify(r.server).slice(0, 200));
       }
-    } catch (e) {
-      errors++;
-      if (errors <= 3) {
-        const err = e as Error;
-        console.warn('[app→phone]', c.id, err.message, JSON.stringify(contactToPhonePayload(c)));
-      }
     }
-
-    if (done % 25 === 0 || done === total) {
-      onProgress?.({ phase: 'app-to-phone', done, total, message: `폰에 저장 중... ${done}/${total}` });
-    }
-
-    if (linkUpdates.length >= 500) {
-      await flushLinkUpdates(linkUpdates);
-      linkUpdates.length = 0;
-    }
+    onProgress?.({
+      phase: 'app-to-phone',
+      done: updateTasks.length + Math.min(addTasks.length, i + CONCURRENT),
+      total: updateTasks.length + addTasks.length,
+      message: `폰에 추가 중... ${Math.min(addTasks.length, i + CONCURRENT)}/${addTasks.length}`,
+    });
   }
 
   if (linkUpdates.length) await flushLinkUpdates(linkUpdates);
 
-  onProgress?.({ phase: 'done', done: total, total, message: `완료: +${added} / 수정 ${updated} / 실패 ${errors}` });
-  return { added, updated, errors };
+  onProgress?.({ phase: 'done', done: addTasks.length + updateTasks.length, total: addTasks.length + updateTasks.length + skipped, message: `완료: +${added} / 수정 ${updated} / 스킵 ${skipped} / 실패 ${errors}` });
+  return { added, updated, skipped, errors };
 }
 
 async function flushLinkUpdates(updates: { id: string; phone_contact_id: string }[]) {
@@ -400,7 +477,7 @@ export async function syncPhoneToApp(userId: string, onProgress?: ProgressHandle
 
 export async function runTwoWaySync(userId: string, onProgress?: ProgressHandler): Promise<{
   phoneToApp: { inserted: number; updated: number; softDeleted: number; errors: number };
-  appToPhone: { added: number; updated: number; errors: number };
+  appToPhone: { added: number; updated: number; skipped: number; errors: number };
 }> {
   const granted = await ensurePermission();
   if (!granted) throw new Error('연락처 접근 권한이 거부되었습니다.');
