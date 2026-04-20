@@ -6,6 +6,7 @@ import {
   ensurePermission,
   getSyncStats,
   runTwoWaySync,
+  syncAppToPhone,
   type SyncStats,
   type SyncProgress,
 } from '@/lib/phoneSync';
@@ -143,6 +144,40 @@ export default function SyncScreen() {
             <Text style={styles.primaryBtnText}>양방향 동기화 시작</Text>
           </Pressable>
 
+          <Pressable
+            style={[styles.altActionBtn, busy && styles.btnDisabled]}
+            onPress={() => {
+              if (!user || !stats) return;
+              Alert.alert(
+                '앱 → 폰 단방향',
+                `앱의 ${stats.appCount.toLocaleString()}건을 폰에 저장합니다. 폰의 변경사항은 서버로 올리지 않습니다.\n\n공유받은 계정 연락처를 폰에 내보낼 때 안전합니다. 진행할까요?`,
+                [
+                  { text: '취소', style: 'cancel' },
+                  {
+                    text: '시작',
+                    onPress: async () => {
+                      setLastResult(null);
+                      setProgress({ phase: 'phone-read', done: 0, total: 0, message: '준비 중...' });
+                      try {
+                        const r = await syncAppToPhone(user.id, setProgress);
+                        setLastResult(`앱→폰 완료: 신규 +${r.added} / 수정 ${r.updated} / 스킵 ${r.skipped} / 실패 ${r.errors}`);
+                        await refreshStats();
+                      } catch (e) {
+                        Alert.alert('실패', (e as Error).message);
+                      } finally {
+                        setProgress(null);
+                      }
+                    },
+                  },
+                ]
+              );
+            }}
+            disabled={busy || !stats}
+          >
+            <FontAwesome name="mobile" size={16} color="#6366f1" />
+            <Text style={styles.altActionBtnText}>앱 → 폰 단방향만</Text>
+          </Pressable>
+
           <Text style={styles.note}>
             💡 앱이 열려있는 동안은 서버 변경이 폰에 자동 반영됩니다.{'\n'}
             폰에서 추가/수정한 내용은 앱을 포그라운드로 전환할 때마다 자동 감지되어 서버로 올라갑니다.
@@ -184,6 +219,8 @@ const styles = StyleSheet.create({
   altBtn: { backgroundColor: '#10b981' },
   btnDisabled: { opacity: 0.5 },
   primaryBtnText: { color: '#fff', fontSize: 15, fontWeight: '600' },
+  altActionBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: '#eef2ff', borderRadius: 12, padding: 12, marginBottom: 10 },
+  altActionBtnText: { color: '#6366f1', fontSize: 14, fontWeight: '600' },
   note: { fontSize: 12, color: '#6b7280', lineHeight: 18, marginTop: 12, padding: 12, backgroundColor: '#fff', borderRadius: 10 },
   cardError: { backgroundColor: '#fef2f2', borderRadius: 12, padding: 16, alignItems: 'center', gap: 10 },
   errorText: { fontSize: 13, color: '#991b1b', textAlign: 'center' },
