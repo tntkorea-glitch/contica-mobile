@@ -1,7 +1,13 @@
 import * as Contacts from 'expo-contacts';
 import { supabase } from './supabase';
-import type { Contact } from './types';
-import { addContactsBatch, isBatchAvailable, type BatchContact } from '../modules/contacts-batch/src';
+import type { Contact, Group } from './types';
+import {
+  addContactsBatch,
+  createPhoneGroup,
+  getPhoneGroups,
+  isBatchAvailable,
+  type BatchContact,
+} from '../modules/contacts-batch/src';
 
 export type PhoneContact = Contacts.ExistingContact;
 
@@ -159,6 +165,126 @@ export async function getSyncStats(userId: string): Promise<SyncStats> {
     phoneOnly,
     appOnly,
   };
+}
+
+async function fetchAllContactGroupMemberships(): Promise<{ contact_id: string; group_id: string }[]> {
+  const PAGE = 1000;
+  const all: { contact_id: string; group_id: string }[] = [];
+  let from = 0;
+  while (true) {
+    const { data, error } = await supabase
+      .from('contact_groups')
+      .select('contact_id, group_id')
+      .range(from, from + PAGE - 1);
+    if (error) throw error;
+    const rows = (data ?? []) as { contact_id: string; group_id: string }[];
+    all.push(...rows);
+    if (rows.length < PAGE) break;
+    from += PAGE;
+  }
+  return all;
+}
+
+async function ensurePhoneGroupsForServerGroups(
+  userId: string,
+  serverGroups: Group[]
+): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  if (!isBatchAvailable() || serverGroups.length === 0) return map;
+
+  const phoneGroups = await getPhoneGroups();
+  const phoneByTitle = new Map<string, string>();
+  for (const pg of phoneGroups) {
+    if (pg.title) phoneByTitle.set(pg.title.trim(), pg.id);
+  }
+
+  for (const sg of serverGroups) {
+    let phoneGid = (sg.phone_group_id ?? null) as string | null;
+    if (!phoneGid || phoneGid === '-1') {
+      const existing = phoneByTitle.get((sg.name ?? '').trim());
+      if (existing) {
+        phoneGid = existing;
+      } else {
+        try {
+          phoneGid = await createPhoneGroup(sg.name || '그룹');
+          if (phoneGid === '-1') phoneGid = null;
+        } catch (e) {
+          console.warn('[ensurePhoneGroup]', sg.name, (e as Error).message);
+          phoneGid = null;
+        }
+      }
+      if (phoneGid && sg.user_id === userId) {
+        const { error } = await supabase
+          .from('groups')
+          .update({ phone_group_id: phoneGid })
+          .eq('id', sg.id);
+        if (error) console.warn('[link phoneGroup]', error.message);
+      }
+    }
+    if (phoneGid) map.set(sg.id, phoneGid);
+  }
+  return map;
+}
+
+async function fetchAllVisibleGroups(userId: string): Promise<Group[]> {
+  const { data: shares } = await supabase
+    .from('user_shares')
+    .select('main_user_id')
+    .eq('member_user_id', userId)
+    .eq('scope', 'all')
+    .is('revoked_at', null);
+  const targetIds = [userId, ...((shares ?? []).map(s => s.main_user_id as string))];
+  const all: Group[] = [];
+  for (const uid of targetIds) {
+    const { data } = await supabase
+      .from('groups')
+      .select('*')
+      .eq('user_id', uid)
+      .is('deleted_at', null);
+    all.push(...((data ?? []) as Group[]));
+  }
+  return all;
+}
+
+export async function cleanupEmptyGroups(userId: string): Promise<number> {
+  const { data: myGroups } = await supabase
+    .from('groups')
+    .select('id')
+    .eq('user_id', userId)
+    .is('deleted_at', null);
+  if (!myGroups || myGroups.length === 0) return 0;
+
+  const groupIds = myGroups.map(g => g.id as string);
+
+  const { data: activeMemberships, error: memErr } = await supabase
+    .from('contact_groups')
+    .select('group_id, contacts!inner(id, deleted_at)')
+    .in('group_id', groupIds)
+    .is('contacts.deleted_at', null);
+  if (memErr) {
+    console.warn('[cleanupEmptyGroups] membership query error:', memErr.message);
+    return 0;
+  }
+
+  const activeGroups = new Set<string>();
+  for (const row of (activeMemberships ?? []) as { group_id: string }[]) {
+    if (row.group_id) activeGroups.add(row.group_id);
+  }
+
+  const emptyGroupIds = groupIds.filter(id => !activeGroups.has(id));
+  if (emptyGroupIds.length === 0) return 0;
+
+  const { error: delErr } = await supabase
+    .from('groups')
+    .update({ deleted_at: new Date().toISOString() })
+    .eq('user_id', userId)
+    .in('id', emptyGroupIds);
+  if (delErr) {
+    console.warn('[cleanupEmptyGroups] delete error:', delErr.message);
+    return 0;
+  }
+  console.log(`[cleanupEmptyGroups] soft-deleted ${emptyGroupIds.length} empty groups`);
+  return emptyGroupIds.length;
 }
 
 function contactToPhonePayload(c: Contact): Contacts.Contact {
@@ -339,9 +465,33 @@ export async function syncAppToPhone(userId: string, onProgress?: ProgressHandle
 
   // 추가: 네이티브 배치 모듈이 있으면 배치, 없으면 병렬 개별 호출
   if (isBatchAvailable() && addTasks.length > 0) {
+    // 그룹 매핑 준비 (서버 group → 폰 group)
+    let serverToPhoneGroup = new Map<string, string>();
+    let contactToPhoneGroupIds = new Map<string, string[]>();
+    try {
+      const visibleGroups = await fetchAllVisibleGroups(userId);
+      serverToPhoneGroup = await ensurePhoneGroupsForServerGroups(userId, visibleGroups);
+      console.log(`[groups] server=${visibleGroups.length} mapped=${serverToPhoneGroup.size}`);
+
+      if (serverToPhoneGroup.size > 0) {
+        const memberships = await fetchAllContactGroupMemberships();
+        for (const m of memberships) {
+          const phoneGid = serverToPhoneGroup.get(m.group_id);
+          if (!phoneGid) continue;
+          const arr = contactToPhoneGroupIds.get(m.contact_id) ?? [];
+          arr.push(phoneGid);
+          contactToPhoneGroupIds.set(m.contact_id, arr);
+        }
+        console.log(`[groups] memberships loaded for ${contactToPhoneGroupIds.size} contacts`);
+      }
+    } catch (e) {
+      console.warn('[groups mapping]', (e as Error).message);
+    }
+
     // Android ContentProvider는 applyBatch 당 500 ops 제한.
-    // contact 1개 = 최대 7 ops → 60 × 7 = 420 ops (안전마진).
-    const BATCH = 60;
+    // contact 1개 = 최대 ~8 ops (RawContact + Name + Phone×2 + Email×2 + Org + Group)
+    // 50 × 10 = 500 ops 마진 확보 (그룹 많을 수도)
+    const BATCH = 50;
     for (let i = 0; i < addTasks.length; i += BATCH) {
       const slice = addTasks.slice(i, i + BATCH);
       const batchPayload: BatchContact[] = slice.map(t => ({
@@ -357,6 +507,7 @@ export async function syncAppToPhone(userId: string, onProgress?: ProgressHandle
         ].filter(Boolean) as BatchContact['emails'],
         company: t.server.company ?? undefined,
         jobTitle: t.server.position ?? undefined,
+        groupIds: contactToPhoneGroupIds.get(t.server.id) ?? undefined,
       }));
       try {
         const ids = await addContactsBatch(batchPayload);
@@ -422,6 +573,14 @@ export async function syncAppToPhone(userId: string, onProgress?: ProgressHandle
   }
 
   if (linkUpdates.length) await flushLinkUpdates(linkUpdates);
+
+  // 빈 그룹 정리
+  try {
+    const removed = await cleanupEmptyGroups(userId);
+    if (removed > 0) console.log(`[syncAppToPhone] removed ${removed} empty groups`);
+  } catch (e) {
+    console.warn('[syncAppToPhone cleanup]', (e as Error).message);
+  }
 
   onProgress?.({ phase: 'done', done: addTasks.length + updateTasks.length, total: addTasks.length + updateTasks.length + skipped, message: `완료: +${added} / 수정 ${updated} / 스킵 ${skipped} / 실패 ${errors}` });
   return { added, updated, skipped, errors };
@@ -571,6 +730,14 @@ export async function syncPhoneToApp(userId: string, onProgress?: ProgressHandle
     }
   }
 
+  // 빈 그룹 정리
+  try {
+    const removed = await cleanupEmptyGroups(userId);
+    if (removed > 0) console.log(`[syncPhoneToApp] removed ${removed} empty groups`);
+  } catch (e) {
+    console.warn('[syncPhoneToApp cleanup]', (e as Error).message);
+  }
+
   onProgress?.({ phase: 'done', done: total, total, message: `완료: 신규 +${inserted} / 수정 ${updated} / 휴지통 ${softDeleted} / 실패 ${errors}` });
   return { inserted, updated, softDeleted, errors };
 }
@@ -578,13 +745,15 @@ export async function syncPhoneToApp(userId: string, onProgress?: ProgressHandle
 export async function runTwoWaySync(userId: string, onProgress?: ProgressHandler): Promise<{
   phoneToApp: { inserted: number; updated: number; softDeleted: number; errors: number };
   appToPhone: { added: number; updated: number; skipped: number; errors: number };
+  emptyGroupsRemoved: number;
 }> {
   const granted = await ensurePermission();
   if (!granted) throw new Error('연락처 접근 권한이 거부되었습니다.');
 
   const phoneToApp = await syncPhoneToApp(userId, onProgress);
   const appToPhone = await syncAppToPhone(userId, onProgress);
-  return { phoneToApp, appToPhone };
+  const emptyGroupsRemoved = await cleanupEmptyGroups(userId);
+  return { phoneToApp, appToPhone, emptyGroupsRemoved };
 }
 
 export async function applyServerChangeToPhone(contact: Contact, action: 'insert' | 'update' | 'delete'): Promise<void> {

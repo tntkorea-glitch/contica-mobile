@@ -28,6 +28,7 @@ export interface Group {
   name: string;
   color: string;
   contact_count?: number;
+  phone_group_id?: string | null;
   deleted_at?: string | null;
   created_at: string;
   updated_at: string;

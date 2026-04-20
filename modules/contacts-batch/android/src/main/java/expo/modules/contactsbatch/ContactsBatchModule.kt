@@ -1,6 +1,7 @@
 package expo.modules.contactsbatch
 
 import android.content.ContentProviderOperation
+import android.content.ContentValues
 import android.provider.ContactsContract
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
@@ -8,6 +9,40 @@ import expo.modules.kotlin.modules.ModuleDefinition
 class ContactsBatchModule : Module() {
   override fun definition() = ModuleDefinition {
     Name("ContactsBatch")
+
+    AsyncFunction("getPhoneGroups") {
+      val resolver = appContext.reactContext?.contentResolver
+        ?: throw Exception("contentResolver unavailable")
+      val results = mutableListOf<Map<String, Any?>>()
+      val cursor = resolver.query(
+        ContactsContract.Groups.CONTENT_URI,
+        arrayOf(ContactsContract.Groups._ID, ContactsContract.Groups.TITLE, ContactsContract.Groups.DELETED),
+        "${ContactsContract.Groups.DELETED} = 0",
+        null,
+        null
+      )
+      cursor?.use {
+        while (it.moveToNext()) {
+          results.add(mapOf(
+            "id" to it.getLong(0).toString(),
+            "title" to (it.getString(1) ?: "")
+          ))
+        }
+      }
+      return@AsyncFunction results
+    }
+
+    AsyncFunction("createPhoneGroup") { title: String ->
+      val resolver = appContext.reactContext?.contentResolver
+        ?: throw Exception("contentResolver unavailable")
+      val values = ContentValues().apply {
+        put(ContactsContract.Groups.TITLE, title)
+        put(ContactsContract.Groups.GROUP_VISIBLE, 1)
+      }
+      val uri = resolver.insert(ContactsContract.Groups.CONTENT_URI, values)
+      val id = uri?.lastPathSegment?.toLongOrNull()
+      return@AsyncFunction (id ?: -1L).toString()
+    }
 
     AsyncFunction("addContactsBatch") { contacts: List<Map<String, Any?>> ->
       val resolver = appContext.reactContext?.contentResolver
@@ -110,6 +145,26 @@ class ContactsBatchModule : Module() {
                 )
                 .withValue(ContactsContract.CommonDataKinds.Organization.COMPANY, company)
                 .withValue(ContactsContract.CommonDataKinds.Organization.TITLE, jobTitle)
+                .build()
+            )
+          }
+
+          @Suppress("UNCHECKED_CAST")
+          val groupIds = (c["groupIds"] as? List<String>) ?: emptyList()
+          for (gid in groupIds) {
+            val gidLong = gid.toLongOrNull() ?: continue
+            if (gidLong <= 0) continue
+            ops.add(
+              ContentProviderOperation.newInsert(ContactsContract.Data.CONTENT_URI)
+                .withValueBackReference(ContactsContract.Data.RAW_CONTACT_ID, rawIdx)
+                .withValue(
+                  ContactsContract.Data.MIMETYPE,
+                  ContactsContract.CommonDataKinds.GroupMembership.CONTENT_ITEM_TYPE
+                )
+                .withValue(
+                  ContactsContract.CommonDataKinds.GroupMembership.GROUP_ROW_ID,
+                  gidLong
+                )
                 .build()
             )
           }
