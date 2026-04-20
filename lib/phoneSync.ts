@@ -86,17 +86,16 @@ async function fetchContactsByUser(uid: string): Promise<Contact[]> {
       .limit(PAGE);
     if (lastId) q = q.gt('id', lastId);
 
-    const result = await Promise.race([
-      q,
-      new Promise<{ data: null; error: Error }>((_, rej) =>
-        setTimeout(() => rej(new Error(`timeout after 20s page=${safety}`)), 20_000)
-      ),
-    ]) as Awaited<ReturnType<typeof q>>;
+    type QueryResult = { data: Contact[] | null; error: { message: string } | null };
+    const timeoutPromise = new Promise<QueryResult>((_, rej) =>
+      setTimeout(() => rej(new Error(`timeout after 20s page=${safety}`)), 20_000)
+    );
+    const result = await Promise.race([q as unknown as Promise<QueryResult>, timeoutPromise]);
 
     const ms = Date.now() - t0;
     if (result.error) {
       console.warn(`[fetch ${prefix}] page ${safety} error (${ms}ms):`, result.error.message);
-      throw result.error;
+      throw new Error(result.error.message);
     }
     const rows = (result.data ?? []) as Contact[];
     console.log(`[fetch ${prefix}] page ${safety} ${rows.length} rows (${ms}ms)`);
@@ -265,9 +264,17 @@ export async function syncAppToPhone(userId: string, onProgress?: ProgressHandle
 
     if (phone?.id) {
       if (phoneDataMatches(c, phone)) {
-        // 이미 동일 — 폰 쓰기 스킵. 링크만 필요시 업데이트.
-        if (!c.phone_contact_id) linkUpdates.push({ id: c.id, phone_contact_id: phone.id });
+        // 이미 동일 — 폰 쓰기 스킵. 본인 소유 row에만 phone_contact_id 링크.
+        if (!c.phone_contact_id && c.user_id === userId) {
+          linkUpdates.push({ id: c.id, phone_contact_id: phone.id });
+        }
         skipped++;
+        continue;
+      }
+      // 공유받은 메인 row는 updateContactAsync 타겟이 아니라 새 contact로 추가하는 게 맞음
+      // (폰에 같은 번호가 있어도 이름/정보 다르면 별개로 두는 게 안전)
+      if (c.user_id !== userId) {
+        addTasks.push({ server: c, payload: contactToPhonePayload(c) });
         continue;
       }
       const payload = contactToPhonePayload(c);
@@ -281,9 +288,14 @@ export async function syncAppToPhone(userId: string, onProgress?: ProgressHandle
     }
   }
 
-  // 링크만 필요한 건 먼저 bulk upsert
+  console.log(`[sync] matching done. adds=${addTasks.length} updates=${updateTasks.length} links=${linkUpdates.length} skipped=${skipped}`);
+  onProgress?.({ phase: 'app-to-phone', done: 0, total: addTasks.length + updateTasks.length, message: `매칭 완료. 폰 쓰기 준비 (추가 ${addTasks.length}, 수정 ${updateTasks.length}, 스킵 ${skipped})` });
+
+  // 링크만 필요한 건 먼저 bulk upsert (본인 소유만이라 fast)
   if (linkUpdates.length) {
+    console.log(`[sync] flushing ${linkUpdates.length} link updates...`);
     await flushLinkUpdates(linkUpdates);
+    console.log(`[sync] link updates done`);
     linkUpdates.length = 0;
   }
 
