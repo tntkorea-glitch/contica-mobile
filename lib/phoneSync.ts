@@ -392,6 +392,18 @@ export async function syncPhoneToApp(userId: string, onProgress?: ProgressHandle
   return { inserted, updated, softDeleted, errors };
 }
 
+export async function runTwoWaySync(userId: string, onProgress?: ProgressHandler): Promise<{
+  phoneToApp: { inserted: number; updated: number; softDeleted: number; errors: number };
+  appToPhone: { added: number; updated: number; errors: number };
+}> {
+  const granted = await ensurePermission();
+  if (!granted) throw new Error('연락처 접근 권한이 거부되었습니다.');
+
+  const phoneToApp = await syncPhoneToApp(userId, onProgress);
+  const appToPhone = await syncAppToPhone(userId, onProgress);
+  return { phoneToApp, appToPhone };
+}
+
 export async function applyServerChangeToPhone(contact: Contact, action: 'insert' | 'update' | 'delete'): Promise<void> {
   if (contact.phone_contact_id && shouldSkipPhoneSync(contact.phone_contact_id)) return;
   const granted = await ensurePermission();

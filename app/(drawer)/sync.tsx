@@ -5,8 +5,7 @@ import { useAuth } from '@/contexts/AuthContext';
 import {
   ensurePermission,
   getSyncStats,
-  syncAppToPhone,
-  syncPhoneToApp,
+  runTwoWaySync,
   type SyncStats,
   type SyncProgress,
 } from '@/lib/phoneSync';
@@ -43,11 +42,11 @@ export default function SyncScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.id]);
 
-  const runAppToPhone = () => {
+  const runTwoWay = () => {
     if (!user || !stats) return;
     Alert.alert(
-      '앱 → 폰 전체 동기화',
-      `앱의 ${stats.appCount.toLocaleString()}건을 폰에 저장/수정합니다. 수 건~수십 건당 1초 소요, 전체 완료에 수십 분 이상 걸릴 수 있습니다. 진행할까요?`,
+      '양방향 동기화',
+      `폰 ${stats.phoneCount.toLocaleString()}건 + 앱 ${stats.appCount.toLocaleString()}건을 양방향 동기화합니다.\n\n① 폰 → 앱 (매칭 링크 + 신규 서버 반영)\n② 앱 → 폰 (미전송 연락처를 폰에 저장)\n\n첫 실행은 되돌리기 어렵습니다. 진행할까요?`,
       [
         { text: '취소', style: 'cancel' },
         {
@@ -57,35 +56,12 @@ export default function SyncScreen() {
             setLastResult(null);
             setProgress({ phase: 'phone-read', done: 0, total: 0, message: '준비 중...' });
             try {
-              const r = await syncAppToPhone(user.id, setProgress);
-              setLastResult(`앱→폰 완료: 신규 +${r.added} / 수정 ${r.updated} / 실패 ${r.errors}`);
-              await refreshStats();
-            } catch (e) {
-              Alert.alert('실패', (e as Error).message);
-            } finally {
-              setProgress(null);
-            }
-          },
-        },
-      ]
-    );
-  };
-
-  const runPhoneToApp = () => {
-    if (!user || !stats) return;
-    Alert.alert(
-      '폰 → 앱 전체 동기화',
-      `폰의 ${stats.phoneCount.toLocaleString()}건을 서버에 반영합니다. 폰에서 삭제된 연락처는 서버 휴지통으로 이동됩니다. 진행할까요?`,
-      [
-        { text: '취소', style: 'cancel' },
-        {
-          text: '시작',
-          onPress: async () => {
-            setLastResult(null);
-            setProgress({ phase: 'phone-read', done: 0, total: 0, message: '준비 중...' });
-            try {
-              const r = await syncPhoneToApp(user.id, setProgress);
-              setLastResult(`폰→앱 완료: 신규 +${r.inserted} / 수정 ${r.updated} / 휴지통 ${r.softDeleted} / 실패 ${r.errors}`);
+              const r = await runTwoWaySync(user.id, setProgress);
+              setLastResult(
+                `양방향 완료\n`
+                + `폰→앱: 신규 +${r.phoneToApp.inserted} / 수정 ${r.phoneToApp.updated} / 휴지통 ${r.phoneToApp.softDeleted} / 실패 ${r.phoneToApp.errors}\n`
+                + `앱→폰: 신규 +${r.appToPhone.added} / 수정 ${r.appToPhone.updated} / 실패 ${r.appToPhone.errors}`
+              );
               await refreshStats();
             } catch (e) {
               Alert.alert('실패', (e as Error).message);
@@ -162,14 +138,9 @@ export default function SyncScreen() {
             </View>
           ) : null}
 
-          <Pressable style={[styles.primaryBtn, busy && styles.btnDisabled]} onPress={runAppToPhone} disabled={busy || !stats}>
-            <FontAwesome name="mobile" size={18} color="#fff" />
-            <Text style={styles.primaryBtnText}>앱 → 폰 전체 동기화</Text>
-          </Pressable>
-
-          <Pressable style={[styles.primaryBtn, styles.altBtn, busy && styles.btnDisabled]} onPress={runPhoneToApp} disabled={busy || !stats}>
-            <FontAwesome name="cloud-upload" size={18} color="#fff" />
-            <Text style={styles.primaryBtnText}>폰 → 앱 전체 동기화</Text>
+          <Pressable style={[styles.primaryBtn, busy && styles.btnDisabled]} onPress={runTwoWay} disabled={busy || !stats}>
+            <FontAwesome name="exchange" size={18} color="#fff" />
+            <Text style={styles.primaryBtnText}>양방향 동기화 시작</Text>
           </Pressable>
 
           <Text style={styles.note}>
