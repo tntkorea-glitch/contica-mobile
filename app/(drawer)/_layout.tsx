@@ -113,6 +113,16 @@ function CustomDrawerContent(props: DrawerContentComponentProps) {
           <FontAwesome name="refresh" size={16} color="#0ea5e9" style={styles.itemIcon} />
           <Text style={[styles.itemLabel, { color: '#0ea5e9', fontWeight: '600' }]}>폰 동기화</Text>
         </Pressable>
+        <Pressable
+          onPress={() => {
+            router.push('/shares');
+            props.navigation.closeDrawer();
+          }}
+          style={styles.item}
+        >
+          <FontAwesome name="users" size={16} color="#8b5cf6" style={styles.itemIcon} />
+          <Text style={[styles.itemLabel, { color: '#8b5cf6', fontWeight: '600' }]}>계정 공유</Text>
+        </Pressable>
         <Pressable onPress={signOut} style={styles.item}>
           <FontAwesome name="sign-out" size={16} color="#ef4444" style={styles.itemIcon} />
           <Text style={[styles.itemLabel, { color: '#ef4444' }]}>로그아웃</Text>
@@ -167,6 +177,7 @@ export default function DrawerLayout() {
     >
       <Drawer.Screen name="index" options={{ title: '연락처' }} />
       <Drawer.Screen name="sync" options={{ title: '폰 동기화', drawerItemStyle: { display: 'none' } }} />
+      <Drawer.Screen name="shares" options={{ title: '계정 공유', drawerItemStyle: { display: 'none' } }} />
     </Drawer>
   );
 }
