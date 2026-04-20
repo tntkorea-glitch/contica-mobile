@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useMemo } from 'react';
+import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { View, Text, FlatList, TextInput, StyleSheet, Pressable, ActivityIndicator, RefreshControl } from 'react-native';
 import { supabase } from '@/lib/supabase';
 import type { Contact } from '@/lib/types';
@@ -14,6 +14,7 @@ export default function ContactsScreen() {
   const [search, setSearch] = useState('');
   const [hasMore, setHasMore] = useState(true);
   const [page, setPage] = useState(0);
+  const [liveTick, setLiveTick] = useState(0);
 
   const load = useCallback(async (opts?: { reset?: boolean }) => {
     const reset = opts?.reset ?? false;
@@ -56,6 +57,32 @@ export default function ContactsScreen() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [search]);
 
+  const loadRef = useRef(load);
+  loadRef.current = load;
+
+  useEffect(() => {
+    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+    const channel = supabase
+      .channel('contacts-realtime')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'contacts' },
+        () => {
+          if (debounceTimer) clearTimeout(debounceTimer);
+          debounceTimer = setTimeout(() => {
+            setLiveTick(t => t + 1);
+            loadRef.current({ reset: true });
+          }, 300);
+        }
+      )
+      .subscribe();
+
+    return () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      supabase.removeChannel(channel);
+    };
+  }, []);
+
   const onRefresh = () => {
     setRefreshing(true);
     load({ reset: true });
@@ -68,9 +95,15 @@ export default function ContactsScreen() {
 
   const listHeader = useMemo(() => (
     <View style={styles.header}>
-      <Text style={styles.totalText}>
-        {total !== null ? `${total.toLocaleString()}명의 연락처` : '연락처'}
-      </Text>
+      <View style={styles.headerTop}>
+        <Text style={styles.totalText}>
+          {total !== null ? `${total.toLocaleString()}명의 연락처` : '연락처'}
+        </Text>
+        <View style={styles.liveBadge}>
+          <View style={styles.liveDot} />
+          <Text style={styles.liveText}>실시간{liveTick > 0 ? ` · ${liveTick}` : ''}</Text>
+        </View>
+      </View>
       <TextInput
         style={styles.search}
         placeholder="이름·전화·이메일 검색"
@@ -79,7 +112,7 @@ export default function ContactsScreen() {
         onChangeText={setSearch}
       />
     </View>
-  ), [search, total]);
+  ), [search, total, liveTick]);
 
   if (loading) {
     return (
@@ -133,7 +166,11 @@ const styles = StyleSheet.create({
   center: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 40 },
   list: { flex: 1, backgroundColor: '#fff' },
   header: { padding: 12, backgroundColor: '#fff', borderBottomWidth: 1, borderBottomColor: '#e5e7eb', gap: 8 },
+  headerTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   totalText: { fontSize: 13, color: '#6b7280', fontWeight: '500' },
+  liveBadge: { flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: '#f0fdf4', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 10 },
+  liveDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: '#22c55e' },
+  liveText: { fontSize: 11, color: '#16a34a', fontWeight: '600' },
   search: { backgroundColor: '#f3f4f6', borderRadius: 10, padding: 10, fontSize: 14 },
   row: { flexDirection: 'row', alignItems: 'center', padding: 12, gap: 12, borderBottomWidth: 1, borderBottomColor: '#f3f4f6' },
   avatar: { width: 40, height: 40, borderRadius: 20, backgroundColor: '#6366f1', justifyContent: 'center', alignItems: 'center' },
