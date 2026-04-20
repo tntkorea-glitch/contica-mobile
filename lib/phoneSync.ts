@@ -258,7 +258,7 @@ export async function syncAppToPhone(userId: string, onProgress?: ProgressHandle
     linkUpdates.length = 0;
   }
 
-  const CONCURRENT = 10;
+  const CONCURRENT = 30;
   let added = 0;
   let updated = 0;
   let errors = 0;
