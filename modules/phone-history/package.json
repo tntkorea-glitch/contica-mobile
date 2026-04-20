@@ -1,0 +1,7 @@
+{
+  "name": "phone-history",
+  "version": "0.1.0",
+  "description": "Local Expo module: read call log + SMS on Android to discover unknown phone numbers",
+  "main": "src/index.ts",
+  "private": true
+}

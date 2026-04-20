@@ -67,39 +67,50 @@ export async function readAllPhoneContacts(): Promise<PhoneContact[]> {
   return data ?? [];
 }
 
-async function readAllServerContacts(_userId: string): Promise<Contact[]> {
-  // RLS에서 본인 소유 + 공유받은 메인 계정 contacts를 자동으로 포함.
-  // count('exact')는 공유 정책으로 인한 subquery 때문에 느릴 수 있어서,
-  // id 기준 keyset pagination으로 순차 페치 (커서 기반, 빠름).
+async function fetchContactsByUser(uid: string): Promise<Contact[]> {
   const PAGE = 1000;
+  const CONCURRENT = 10;
+  const { count } = await supabase
+    .from('contacts')
+    .select('id', { count: 'exact', head: true })
+    .eq('user_id', uid)
+    .is('deleted_at', null);
+  if (!count) return [];
+  const pageCount = Math.ceil(count / PAGE);
   const all: Contact[] = [];
-  let lastId: string | null = null;
-  let safety = 0;
-
-  while (true) {
-    let q = supabase
-      .from('contacts')
-      .select('*')
-      .is('deleted_at', null)
-      .order('id', { ascending: true })
-      .limit(PAGE);
-    if (lastId) q = q.gt('id', lastId);
-
-    const { data, error } = await q;
-    if (error) throw error;
-    const rows = (data ?? []) as Contact[];
-    if (rows.length === 0) break;
-    all.push(...rows);
-    lastId = rows[rows.length - 1].id;
-    if (rows.length < PAGE) break;
-
-    safety++;
-    if (safety > 200) {
-      console.warn('[readAllServerContacts] safety break at', all.length);
-      break;
+  for (let i = 0; i < pageCount; i += CONCURRENT) {
+    const pages = Array.from({ length: Math.min(CONCURRENT, pageCount - i) }, (_, j) => i + j);
+    const results = await Promise.all(
+      pages.map(p =>
+        supabase
+          .from('contacts')
+          .select('*')
+          .eq('user_id', uid)
+          .is('deleted_at', null)
+          .range(p * PAGE, p * PAGE + PAGE - 1)
+      )
+    );
+    for (const r of results) {
+      if (r.error) throw r.error;
+      all.push(...((r.data ?? []) as Contact[]));
     }
   }
   return all;
+}
+
+async function readAllServerContacts(userId: string): Promise<Contact[]> {
+  // 본인 소유 + 공유받은 메인 계정 각각 user_id로 병렬 페치.
+  // RLS의 OR 조건 subquery를 피해 단순 eq로 인덱스 직타.
+  const { data: shares } = await supabase
+    .from('user_shares')
+    .select('main_user_id')
+    .eq('member_user_id', userId)
+    .eq('scope', 'all')
+    .is('revoked_at', null);
+
+  const targetIds = [userId, ...((shares ?? []).map(s => s.main_user_id as string))];
+  const results = await Promise.all(targetIds.map(uid => fetchContactsByUser(uid)));
+  return results.flat();
 }
 
 export async function getSyncStats(userId: string): Promise<SyncStats> {
