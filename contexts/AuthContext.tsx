@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from 'react';
 import * as WebBrowser from 'expo-web-browser';
-import * as Google from 'expo-auth-session/providers/google';
+import * as Linking from 'expo-linking';
 import type { Session, User } from '@supabase/supabase-js';
 import { supabase } from '@/lib/supabase';
 
@@ -23,13 +23,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
 
-  // Google OAuth — native SDK 경유 (ID Token flow, Google 정책 준수)
-  const [, googleResponse, promptGoogle] = Google.useIdTokenAuthRequest({
-    clientId: process.env.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID,
-    iosClientId: process.env.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID,
-    androidClientId: process.env.EXPO_PUBLIC_GOOGLE_ANDROID_CLIENT_ID,
-  });
-
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => {
       setSession(data.session);
@@ -44,19 +37,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => sub.subscription.unsubscribe();
   }, []);
 
-  // Google 응답 처리 — id_token 받으면 Supabase 세션 생성
-  useEffect(() => {
-    if (googleResponse?.type === 'success') {
-      const idToken = googleResponse.params?.id_token;
-      if (idToken) {
-        supabase.auth.signInWithIdToken({ provider: 'google', token: idToken })
-          .then(({ error }) => {
-            if (error) console.warn('[google signin]', error.message);
-          });
-      }
-    }
-  }, [googleResponse]);
-
   const signInWithEmail = async (email: string, password: string) => {
     const { error } = await supabase.auth.signInWithPassword({ email, password });
     if (error) throw error;
@@ -68,7 +48,35 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   const signInWithGoogle = async () => {
-    await promptGoogle();
+    const redirectTo = Linking.createURL('auth/callback');
+    const { data, error } = await supabase.auth.signInWithOAuth({
+      provider: 'google',
+      options: { redirectTo, skipBrowserRedirect: true },
+    });
+    if (error) throw error;
+    if (!data?.url) throw new Error('OAuth URL 생성 실패');
+
+    const result = await WebBrowser.openAuthSessionAsync(data.url, redirectTo);
+    if (result.type !== 'success' || !result.url) return;
+
+    const parsed = Linking.parse(result.url);
+    const code = (parsed.queryParams?.code as string | undefined);
+    if (code) {
+      const { error: exchangeErr } = await supabase.auth.exchangeCodeForSession(code);
+      if (exchangeErr) throw exchangeErr;
+      return;
+    }
+
+    // implicit flow fallback (hash에 토큰 포함)
+    const hashPart = result.url.split('#')[1];
+    if (hashPart) {
+      const hashParams = new URLSearchParams(hashPart);
+      const access_token = hashParams.get('access_token');
+      const refresh_token = hashParams.get('refresh_token');
+      if (access_token && refresh_token) {
+        await supabase.auth.setSession({ access_token, refresh_token });
+      }
+    }
   };
 
   const signOut = async () => {
