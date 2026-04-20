@@ -1,11 +1,27 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { View, Text, FlatList, TextInput, StyleSheet, Pressable, ActivityIndicator, RefreshControl } from 'react-native';
+import { useLocalSearchParams, useNavigation } from 'expo-router';
 import { supabase } from '@/lib/supabase';
-import type { Contact } from '@/lib/types';
+import type { Contact, Group } from '@/lib/types';
 
 const PAGE_SIZE = 50;
 
+type FilterKey = 'all' | 'favorites' | 'unnamed' | 'trash' | 'group';
+
+const FILTER_TITLE: Record<FilterKey, string> = {
+  all: '전체 연락처',
+  favorites: '즐겨찾기',
+  unnamed: '이름없는 연락처',
+  trash: '휴지통',
+  group: '그룹',
+};
+
 export default function ContactsScreen() {
+  const params = useLocalSearchParams<{ filter?: string; groupId?: string }>();
+  const filter = (params.filter as FilterKey | undefined) ?? 'all';
+  const groupId = params.groupId;
+  const navigation = useNavigation();
+
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [total, setTotal] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
@@ -15,6 +31,25 @@ export default function ContactsScreen() {
   const [hasMore, setHasMore] = useState(true);
   const [page, setPage] = useState(0);
   const [liveTick, setLiveTick] = useState(0);
+  const [groupName, setGroupName] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (filter === 'group' && groupId) {
+      (async () => {
+        const { data } = await supabase.from('groups').select('name').eq('id', groupId).maybeSingle();
+        setGroupName((data as Pick<Group, 'name'> | null)?.name ?? '그룹');
+      })();
+    } else {
+      setGroupName(null);
+    }
+  }, [filter, groupId]);
+
+  useEffect(() => {
+    const title =
+      filter === 'group' ? (groupName ?? '그룹')
+      : FILTER_TITLE[filter] ?? '연락처';
+    navigation.setOptions({ title });
+  }, [filter, groupName, navigation]);
 
   const load = useCallback(async (opts?: { reset?: boolean }) => {
     const reset = opts?.reset ?? false;
@@ -22,10 +57,30 @@ export default function ContactsScreen() {
     if (reset) setLoading(true);
     else setLoadingMore(true);
 
-    let q = supabase
-      .from('contacts')
-      .select('*', reset ? { count: 'exact' } : undefined)
-      .is('deleted_at', null)
+    const useGroupJoin = filter === 'group' && !!groupId;
+    let q = useGroupJoin
+      ? supabase
+          .from('contacts')
+          .select('*, contact_groups!inner(group_id)', reset ? { count: 'exact' } : undefined)
+          .eq('contact_groups.group_id', groupId as string)
+          .is('deleted_at', null)
+      : supabase
+          .from('contacts')
+          .select('*', reset ? { count: 'exact' } : undefined);
+
+    if (!useGroupJoin) {
+      if (filter === 'trash') {
+        q = q.not('deleted_at', 'is', null);
+      } else {
+        q = q.is('deleted_at', null);
+        if (filter === 'favorites') q = q.eq('favorite', true);
+        if (filter === 'unnamed') {
+          q = q.or('last_name.is.null,last_name.eq.');
+        }
+      }
+    }
+
+    q = q
       .order('last_name', { ascending: true })
       .order('first_name', { ascending: true })
       .range(nextPage * PAGE_SIZE, nextPage * PAGE_SIZE + PAGE_SIZE - 1);
@@ -50,12 +105,12 @@ export default function ContactsScreen() {
     setLoading(false);
     setLoadingMore(false);
     setRefreshing(false);
-  }, [page, search]);
+  }, [page, search, filter, groupId]);
 
   useEffect(() => {
     load({ reset: true });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [search]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search, filter, groupId]);
 
   const loadRef = useRef(load);
   loadRef.current = load;
@@ -93,12 +148,19 @@ export default function ContactsScreen() {
     load();
   };
 
+  const subLabel =
+    filter === 'group' ? (groupName ? `그룹 · ${groupName}` : '그룹')
+    : FILTER_TITLE[filter];
+
   const listHeader = useMemo(() => (
     <View style={styles.header}>
       <View style={styles.headerTop}>
-        <Text style={styles.totalText}>
-          {total !== null ? `${total.toLocaleString()}명의 연락처` : '연락처'}
-        </Text>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.totalText}>
+            {total !== null ? `${total.toLocaleString()}명` : '…'}
+            <Text style={styles.subLabel}>  {subLabel}</Text>
+          </Text>
+        </View>
         <View style={styles.liveBadge}>
           <View style={styles.liveDot} />
           <Text style={styles.liveText}>실시간{liveTick > 0 ? ` · ${liveTick}` : ''}</Text>
@@ -112,7 +174,7 @@ export default function ContactsScreen() {
         onChangeText={setSearch}
       />
     </View>
-  ), [search, total, liveTick]);
+  ), [search, total, liveTick, subLabel]);
 
   if (loading) {
     return (
@@ -167,7 +229,8 @@ const styles = StyleSheet.create({
   list: { flex: 1, backgroundColor: '#fff' },
   header: { padding: 12, backgroundColor: '#fff', borderBottomWidth: 1, borderBottomColor: '#e5e7eb', gap: 8 },
   headerTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  totalText: { fontSize: 13, color: '#6b7280', fontWeight: '500' },
+  totalText: { fontSize: 14, color: '#111827', fontWeight: '600' },
+  subLabel: { fontSize: 12, color: '#6b7280', fontWeight: '500' },
   liveBadge: { flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: '#f0fdf4', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 10 },
   liveDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: '#22c55e' },
   liveText: { fontSize: 11, color: '#16a34a', fontWeight: '600' },
