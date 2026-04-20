@@ -387,11 +387,16 @@ export async function syncAppToPhone(userId: string, onProgress?: ProgressHandle
 
 async function flushLinkUpdates(updates: { id: string; phone_contact_id: string }[]) {
   if (!updates.length) return;
-  const BULK = 500;
-  for (let i = 0; i < updates.length; i += BULK) {
-    const slice = updates.slice(i, i + BULK);
-    const { error } = await supabase.from('contacts').upsert(slice, { onConflict: 'id' });
-    if (error) console.warn('[link bulk-upsert]', error.message);
+  const CONCURRENT = 30;
+  for (let i = 0; i < updates.length; i += CONCURRENT) {
+    const slice = updates.slice(i, i + CONCURRENT);
+    await Promise.all(slice.map(async u => {
+      const { error } = await supabase
+        .from('contacts')
+        .update({ phone_contact_id: u.phone_contact_id })
+        .eq('id', u.id);
+      if (error) console.warn('[link update]', error.message);
+    }));
   }
 }
 
