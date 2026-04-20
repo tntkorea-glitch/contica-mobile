@@ -16,9 +16,14 @@ import {
 } from '../../modules/phone-history/src';
 import {
   addContactsBatch,
+  createPhoneGroup,
+  getPhoneGroups,
   isBatchAvailable,
   type BatchContact,
 } from '../../modules/contacts-batch/src';
+
+const CLEANUP_GROUP_NAME = '정리필요';
+const CLEANUP_GROUP_COLOR = '#f59e0b';
 
 interface UnknownNumber {
   number: string;
@@ -153,7 +158,49 @@ export default function DiscoverScreen() {
             setBusy(true);
             setLastAddedResult(null);
             try {
-              // 1. 폰에 배치 추가
+              // 0. "정리필요" 그룹 ensure (서버 + 폰)
+              let serverGroupId: string | null = null;
+              let phoneGroupId: string | null = null;
+              try {
+                const { data: existing } = await supabase
+                  .from('groups')
+                  .select('id, phone_group_id')
+                  .eq('user_id', user.id)
+                  .eq('name', CLEANUP_GROUP_NAME)
+                  .is('deleted_at', null)
+                  .maybeSingle();
+                if (existing) {
+                  serverGroupId = existing.id as string;
+                  phoneGroupId = (existing as { phone_group_id?: string | null }).phone_group_id ?? null;
+                } else {
+                  const { data: newGroup } = await supabase
+                    .from('groups')
+                    .insert({ user_id: user.id, name: CLEANUP_GROUP_NAME, color: CLEANUP_GROUP_COLOR })
+                    .select('id')
+                    .single();
+                  if (newGroup) serverGroupId = newGroup.id as string;
+                }
+
+                if (serverGroupId && isBatchAvailable() && !phoneGroupId) {
+                  const phoneGroups = await getPhoneGroups();
+                  const match = phoneGroups.find(g => (g.title ?? '').trim() === CLEANUP_GROUP_NAME);
+                  if (match) phoneGroupId = match.id;
+                  else {
+                    const newId = await createPhoneGroup(CLEANUP_GROUP_NAME);
+                    if (newId && newId !== '-1') phoneGroupId = newId;
+                  }
+                  if (phoneGroupId) {
+                    await supabase
+                      .from('groups')
+                      .update({ phone_group_id: phoneGroupId })
+                      .eq('id', serverGroupId);
+                  }
+                }
+              } catch (e) {
+                console.warn('[discover group setup]', (e as Error).message);
+              }
+
+              // 1. 폰에 배치 추가 (그룹 포함)
               const BATCH = 50;
               let phoneAdded = 0;
               const phoneIds: string[] = [];
@@ -164,6 +211,7 @@ export default function DiscoverScreen() {
                     firstName: u.label ?? '',
                     lastName: '',
                     phoneNumbers: [{ label: 'mobile', number: u.number }],
+                    groupIds: phoneGroupId ? [phoneGroupId] : undefined,
                   }));
                   try {
                     const ids = await addContactsBatch(payload);
@@ -198,7 +246,7 @@ export default function DiscoverScreen() {
                 }
               }
 
-              // 2. 서버에 bulk insert
+              // 2. 서버에 bulk insert (id 반환받음)
               const serverRows = unknown.map((u, i) => ({
                 user_id: user.id,
                 first_name: u.label ?? '',
@@ -208,15 +256,31 @@ export default function DiscoverScreen() {
                 phone_contact_id: phoneIds[i] || null,
               }));
               let serverAdded = 0;
+              const newContactIds: string[] = [];
               const BULK = 500;
               for (let i = 0; i < serverRows.length; i += BULK) {
                 const slice = serverRows.slice(i, i + BULK);
-                const { error } = await supabase.from('contacts').insert(slice);
+                const { data, error } = await supabase.from('contacts').insert(slice).select('id');
                 if (error) console.warn('[discover server insert]', error.message);
-                else serverAdded += slice.length;
+                else {
+                  serverAdded += slice.length;
+                  newContactIds.push(...((data ?? []).map(r => r.id as string)));
+                }
               }
 
-              setLastAddedResult(`완료: 폰 +${phoneAdded} / 서버 +${serverAdded}`);
+              // 3. contact_groups 링크 (서버)
+              if (serverGroupId && newContactIds.length > 0) {
+                const cgRows = newContactIds.map(id => ({ contact_id: id, group_id: serverGroupId! }));
+                for (let i = 0; i < cgRows.length; i += BULK) {
+                  const slice = cgRows.slice(i, i + BULK);
+                  const { error } = await supabase.from('contact_groups').insert(slice);
+                  if (error) console.warn('[discover cg insert]', error.message);
+                }
+              }
+
+              setLastAddedResult(
+                `완료: 폰 +${phoneAdded} / 서버 +${serverAdded} / 그룹 '${CLEANUP_GROUP_NAME}'에 ${newContactIds.length}개 추가`
+              );
               setUnknown([]);
             } catch (e) {
               Alert.alert('실패', (e as Error).message);
