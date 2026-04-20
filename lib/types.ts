@@ -15,6 +15,7 @@ export interface Contact {
   profile_image?: string;
   favorite: boolean;
   version: number;
+  phone_contact_id?: string | null;
   deleted_at?: string | null;
   created_at: string;
   updated_at: string;

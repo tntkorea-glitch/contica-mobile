@@ -1,0 +1,221 @@
+import { useEffect, useState } from 'react';
+import { View, Text, Pressable, StyleSheet, ActivityIndicator, Alert, ScrollView } from 'react-native';
+import { FontAwesome } from '@expo/vector-icons';
+import { useAuth } from '@/contexts/AuthContext';
+import {
+  ensurePermission,
+  getSyncStats,
+  syncAppToPhone,
+  syncPhoneToApp,
+  type SyncStats,
+  type SyncProgress,
+} from '@/lib/phoneSync';
+
+export default function SyncScreen() {
+  const { user } = useAuth();
+  const [permission, setPermission] = useState<'unknown' | 'granted' | 'denied'>('unknown');
+  const [stats, setStats] = useState<SyncStats | null>(null);
+  const [statsLoading, setStatsLoading] = useState(false);
+  const [progress, setProgress] = useState<SyncProgress | null>(null);
+  const [lastResult, setLastResult] = useState<string | null>(null);
+
+  const refreshStats = async () => {
+    if (!user) return;
+    const granted = await ensurePermission();
+    setPermission(granted ? 'granted' : 'denied');
+    if (!granted) {
+      setStats(null);
+      return;
+    }
+    setStatsLoading(true);
+    try {
+      const s = await getSyncStats(user.id);
+      setStats(s);
+    } catch (e) {
+      Alert.alert('통계 조회 실패', (e as Error).message);
+    } finally {
+      setStatsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    refreshStats();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id]);
+
+  const runAppToPhone = () => {
+    if (!user || !stats) return;
+    Alert.alert(
+      '앱 → 폰 전체 동기화',
+      `앱의 ${stats.appCount.toLocaleString()}건을 폰에 저장/수정합니다. 수 건~수십 건당 1초 소요, 전체 완료에 수십 분 이상 걸릴 수 있습니다. 진행할까요?`,
+      [
+        { text: '취소', style: 'cancel' },
+        {
+          text: '시작',
+          style: 'destructive',
+          onPress: async () => {
+            setLastResult(null);
+            setProgress({ phase: 'phone-read', done: 0, total: 0, message: '준비 중...' });
+            try {
+              const r = await syncAppToPhone(user.id, setProgress);
+              setLastResult(`앱→폰 완료: 신규 +${r.added} / 수정 ${r.updated} / 실패 ${r.errors}`);
+              await refreshStats();
+            } catch (e) {
+              Alert.alert('실패', (e as Error).message);
+            } finally {
+              setProgress(null);
+            }
+          },
+        },
+      ]
+    );
+  };
+
+  const runPhoneToApp = () => {
+    if (!user || !stats) return;
+    Alert.alert(
+      '폰 → 앱 전체 동기화',
+      `폰의 ${stats.phoneCount.toLocaleString()}건을 서버에 반영합니다. 폰에서 삭제된 연락처는 서버 휴지통으로 이동됩니다. 진행할까요?`,
+      [
+        { text: '취소', style: 'cancel' },
+        {
+          text: '시작',
+          onPress: async () => {
+            setLastResult(null);
+            setProgress({ phase: 'phone-read', done: 0, total: 0, message: '준비 중...' });
+            try {
+              const r = await syncPhoneToApp(user.id, setProgress);
+              setLastResult(`폰→앱 완료: 신규 +${r.inserted} / 수정 ${r.updated} / 휴지통 ${r.softDeleted} / 실패 ${r.errors}`);
+              await refreshStats();
+            } catch (e) {
+              Alert.alert('실패', (e as Error).message);
+            } finally {
+              setProgress(null);
+            }
+          },
+        },
+      ]
+    );
+  };
+
+  const busy = progress !== null;
+
+  return (
+    <ScrollView style={styles.container} contentContainerStyle={{ padding: 16 }}>
+      <Text style={styles.title}>폰 연락처 동기화</Text>
+      <Text style={styles.subtitle}>
+        앱과 폰 기본 연락처를 양방향 동기화합니다. 첫 실행은 되돌리기 어려우니 내용을 확인하고 진행하세요.
+      </Text>
+
+      {permission === 'denied' ? (
+        <View style={styles.cardError}>
+          <FontAwesome name="exclamation-triangle" size={18} color="#ef4444" />
+          <Text style={styles.errorText}>
+            연락처 권한이 거부되었습니다. 설정 앱에서 Contica의 연락처 권한을 허용해 주세요.
+          </Text>
+          <Pressable style={styles.secondaryBtn} onPress={refreshStats}>
+            <Text style={styles.secondaryBtnText}>권한 재확인</Text>
+          </Pressable>
+        </View>
+      ) : (
+        <>
+          <View style={styles.statsCard}>
+            <View style={styles.statsHeader}>
+              <Text style={styles.statsTitle}>현재 상태</Text>
+              <Pressable onPress={refreshStats} disabled={busy || statsLoading} style={styles.refreshBtn}>
+                {statsLoading ? (
+                  <ActivityIndicator size="small" color="#6366f1" />
+                ) : (
+                  <FontAwesome name="refresh" size={14} color="#6366f1" />
+                )}
+              </Pressable>
+            </View>
+            {stats ? (
+              <View style={styles.statsGrid}>
+                <StatItem label="폰" value={stats.phoneCount} color="#6366f1" />
+                <StatItem label="앱(서버)" value={stats.appCount} color="#10b981" />
+                <StatItem label="매칭됨" value={stats.matchedCount} color="#f59e0b" />
+                <StatItem label="폰에만" value={stats.phoneOnly} color="#6b7280" />
+                <StatItem label="앱에만" value={stats.appOnly} color="#6b7280" />
+              </View>
+            ) : (
+              <View style={{ alignItems: 'center', padding: 20 }}>
+                <ActivityIndicator color="#6366f1" />
+              </View>
+            )}
+          </View>
+
+          {progress ? (
+            <View style={styles.progressCard}>
+              <ActivityIndicator color="#6366f1" />
+              <Text style={styles.progressText}>{progress.message ?? `${progress.done}/${progress.total}`}</Text>
+              {progress.total > 0 ? (
+                <View style={styles.progressBarBg}>
+                  <View style={[styles.progressBarFill, { width: `${Math.min(100, (progress.done / progress.total) * 100)}%` }]} />
+                </View>
+              ) : null}
+            </View>
+          ) : lastResult ? (
+            <View style={styles.resultCard}>
+              <FontAwesome name="check-circle" size={18} color="#10b981" />
+              <Text style={styles.resultText}>{lastResult}</Text>
+            </View>
+          ) : null}
+
+          <Pressable style={[styles.primaryBtn, busy && styles.btnDisabled]} onPress={runAppToPhone} disabled={busy || !stats}>
+            <FontAwesome name="mobile" size={18} color="#fff" />
+            <Text style={styles.primaryBtnText}>앱 → 폰 전체 동기화</Text>
+          </Pressable>
+
+          <Pressable style={[styles.primaryBtn, styles.altBtn, busy && styles.btnDisabled]} onPress={runPhoneToApp} disabled={busy || !stats}>
+            <FontAwesome name="cloud-upload" size={18} color="#fff" />
+            <Text style={styles.primaryBtnText}>폰 → 앱 전체 동기화</Text>
+          </Pressable>
+
+          <Text style={styles.note}>
+            💡 앱이 열려있는 동안은 서버 변경이 폰에 자동 반영됩니다.{'\n'}
+            폰에서 추가/수정한 내용은 앱을 포그라운드로 전환할 때마다 자동 감지되어 서버로 올라갑니다.
+          </Text>
+        </>
+      )}
+    </ScrollView>
+  );
+}
+
+function StatItem({ label, value, color }: { label: string; value: number; color: string }) {
+  return (
+    <View style={styles.statItem}>
+      <Text style={[styles.statValue, { color }]}>{value.toLocaleString()}</Text>
+      <Text style={styles.statLabel}>{label}</Text>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: '#f9fafb' },
+  title: { fontSize: 22, fontWeight: '700', color: '#111827', marginBottom: 6 },
+  subtitle: { fontSize: 13, color: '#6b7280', marginBottom: 20, lineHeight: 18 },
+  statsCard: { backgroundColor: '#fff', borderRadius: 12, padding: 16, marginBottom: 16, borderWidth: 1, borderColor: '#e5e7eb' },
+  statsHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
+  statsTitle: { fontSize: 14, color: '#6b7280', fontWeight: '600' },
+  refreshBtn: { padding: 6 },
+  statsGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 12 },
+  statItem: { flex: 1, minWidth: 80, paddingVertical: 6 },
+  statValue: { fontSize: 20, fontWeight: '700' },
+  statLabel: { fontSize: 11, color: '#9ca3af', marginTop: 2 },
+  progressCard: { backgroundColor: '#eef2ff', borderRadius: 12, padding: 16, marginBottom: 16, gap: 10 },
+  progressText: { fontSize: 13, color: '#3730a3', fontWeight: '500', textAlign: 'center' },
+  progressBarBg: { height: 6, backgroundColor: '#e0e7ff', borderRadius: 3, overflow: 'hidden' },
+  progressBarFill: { height: '100%', backgroundColor: '#6366f1' },
+  resultCard: { flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: '#ecfdf5', borderRadius: 12, padding: 14, marginBottom: 16 },
+  resultText: { fontSize: 13, color: '#065f46', flex: 1 },
+  primaryBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10, backgroundColor: '#6366f1', borderRadius: 12, padding: 14, marginBottom: 10 },
+  altBtn: { backgroundColor: '#10b981' },
+  btnDisabled: { opacity: 0.5 },
+  primaryBtnText: { color: '#fff', fontSize: 15, fontWeight: '600' },
+  note: { fontSize: 12, color: '#6b7280', lineHeight: 18, marginTop: 12, padding: 12, backgroundColor: '#fff', borderRadius: 10 },
+  cardError: { backgroundColor: '#fef2f2', borderRadius: 12, padding: 16, alignItems: 'center', gap: 10 },
+  errorText: { fontSize: 13, color: '#991b1b', textAlign: 'center' },
+  secondaryBtn: { paddingHorizontal: 16, paddingVertical: 8, backgroundColor: '#fff', borderRadius: 8, borderWidth: 1, borderColor: '#fca5a5' },
+  secondaryBtnText: { color: '#991b1b', fontSize: 13, fontWeight: '600' },
+});

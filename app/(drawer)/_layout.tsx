@@ -9,6 +9,7 @@ import { useEffect, useState } from 'react';
 import { View, Text, Pressable, StyleSheet, ActivityIndicator } from 'react-native';
 import { supabase } from '@/lib/supabase';
 import { useAuth } from '@/contexts/AuthContext';
+import { usePhoneSyncBridge } from '@/lib/usePhoneSyncBridge';
 import type { Group } from '@/lib/types';
 
 type FilterKey = 'all' | 'favorites' | 'unnamed' | 'trash' | 'group';
@@ -133,6 +134,16 @@ function CustomDrawerContent(props: DrawerContentComponentProps) {
       <View style={styles.divider} />
 
       <View style={styles.section}>
+        <Pressable
+          onPress={() => {
+            router.push('/sync');
+            props.navigation.closeDrawer();
+          }}
+          style={styles.item}
+        >
+          <FontAwesome name="refresh" size={16} color="#0ea5e9" style={styles.itemIcon} />
+          <Text style={[styles.itemLabel, { color: '#0ea5e9', fontWeight: '600' }]}>폰 동기화</Text>
+        </Pressable>
         <Pressable onPress={signOut} style={styles.item}>
           <FontAwesome name="sign-out" size={16} color="#ef4444" style={styles.itemIcon} />
           <Text style={[styles.itemLabel, { color: '#ef4444' }]}>로그아웃</Text>
@@ -143,6 +154,8 @@ function CustomDrawerContent(props: DrawerContentComponentProps) {
 }
 
 export default function DrawerLayout() {
+  const { user } = useAuth();
+  usePhoneSyncBridge(user?.id);
   return (
     <Drawer
       drawerContent={props => <CustomDrawerContent {...props} />}
@@ -153,6 +166,7 @@ export default function DrawerLayout() {
       }}
     >
       <Drawer.Screen name="index" options={{ title: '연락처' }} />
+      <Drawer.Screen name="sync" options={{ title: '폰 동기화', drawerItemStyle: { display: 'none' } }} />
     </Drawer>
   );
 }
