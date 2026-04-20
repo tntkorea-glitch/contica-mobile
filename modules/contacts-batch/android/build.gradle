@@ -1,6 +1,5 @@
 apply plugin: 'com.android.library'
 apply plugin: 'kotlin-android'
-apply plugin: 'maven-publish'
 
 group = 'expo.modules.contactsbatch'
 version = '0.1.0'
@@ -11,10 +10,15 @@ applyKotlinExpoModulesCorePlugin()
 
 android {
   namespace "expo.modules.contactsbatch"
+  compileSdk rootProject.ext.compileSdkVersion
+
   defaultConfig {
+    minSdkVersion rootProject.ext.minSdkVersion
+    targetSdkVersion rootProject.ext.targetSdkVersion
     versionCode 1
     versionName "0.1.0"
   }
+
   lintOptions {
     abortOnError false
   }
