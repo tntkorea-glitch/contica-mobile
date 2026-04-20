@@ -132,30 +132,33 @@ export async function getSyncStats(userId: string): Promise<SyncStats> {
   };
 }
 
-function contactToPhonePayload(c: Contact): Partial<Contacts.Contact> {
+function contactToPhonePayload(c: Contact): Contacts.Contact {
+  const displayName =
+    [c.last_name, c.first_name].filter(Boolean).join(' ')
+    || c.company
+    || c.phone
+    || '이름 없음';
+
+  const payload: Record<string, unknown> = {
+    contactType: Contacts.ContactTypes.Person,
+    name: displayName,
+  };
+  if (c.first_name) payload.firstName = c.first_name;
+  if (c.last_name) payload.lastName = c.last_name;
+  if (c.company) payload.company = c.company;
+  if (c.position) payload.jobTitle = c.position;
+
   const phoneNumbers: Contacts.PhoneNumber[] = [];
-  if (c.phone) phoneNumbers.push({ label: 'mobile', number: c.phone, isPrimary: true });
-  if (c.phone2) phoneNumbers.push({ label: 'work', number: c.phone2, isPrimary: false });
+  if (c.phone) phoneNumbers.push({ label: 'mobile', number: c.phone });
+  if (c.phone2) phoneNumbers.push({ label: 'work', number: c.phone2 });
+  if (phoneNumbers.length) payload.phoneNumbers = phoneNumbers;
 
   const emails: Contacts.Email[] = [];
-  if (c.email) emails.push({ label: 'home', email: c.email, isPrimary: true });
-  if (c.email2) emails.push({ label: 'work', email: c.email2, isPrimary: false });
+  if (c.email) emails.push({ label: 'home', email: c.email });
+  if (c.email2) emails.push({ label: 'work', email: c.email2 });
+  if (emails.length) payload.emails = emails;
 
-  const addresses: Contacts.Address[] = [];
-  if (c.address) addresses.push({ label: 'home', street: c.address });
-
-  return {
-    contactType: Contacts.ContactTypes.Person,
-    name: [c.last_name, c.first_name].filter(Boolean).join(' ') || '이름 없음',
-    firstName: c.first_name || '',
-    lastName: c.last_name || '',
-    company: c.company || undefined,
-    jobTitle: c.position || undefined,
-    phoneNumbers: phoneNumbers.length ? phoneNumbers : undefined,
-    emails: emails.length ? emails : undefined,
-    addresses: addresses.length ? addresses : undefined,
-    note: c.memo || undefined,
-  };
+  return payload as Contacts.Contact;
 }
 
 function phoneToServerPayload(p: PhoneContact, userId: string): Partial<Contact> & { user_id: string; phone_contact_id: string } {
@@ -233,7 +236,10 @@ export async function syncAppToPhone(userId: string, onProgress?: ProgressHandle
       }
     } catch (e) {
       errors++;
-      if (errors <= 5) console.warn('[app→phone]', c.id, (e as Error).message);
+      if (errors <= 3) {
+        const err = e as Error;
+        console.warn('[app→phone]', c.id, err.message, JSON.stringify(contactToPhonePayload(c)));
+      }
     }
 
     if (done % 25 === 0 || done === total) {
