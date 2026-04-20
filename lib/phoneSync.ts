@@ -67,13 +67,14 @@ export async function readAllPhoneContacts(): Promise<PhoneContact[]> {
   return data ?? [];
 }
 
-async function readAllServerContacts(userId: string): Promise<Contact[]> {
+async function readAllServerContacts(_userId: string): Promise<Contact[]> {
+  // RLS에서 본인 소유 + 공유받은 메인 계정 contacts를 자동으로 포함.
+  // 여기선 user_id 필터를 걸지 않아서 공유 데이터도 함께 읽음.
   const PAGE = 1000;
   const CONCURRENT = 10;
   const { count, error: countErr } = await supabase
     .from('contacts')
     .select('id', { count: 'exact', head: true })
-    .eq('user_id', userId)
     .is('deleted_at', null);
   if (countErr) throw countErr;
   if (!count) return [];
@@ -89,7 +90,6 @@ async function readAllServerContacts(userId: string): Promise<Contact[]> {
         supabase
           .from('contacts')
           .select('*')
-          .eq('user_id', userId)
           .is('deleted_at', null)
           .range(p * PAGE, p * PAGE + PAGE - 1)
       )
@@ -510,9 +510,12 @@ export async function syncPhoneToApp(userId: string, onProgress?: ProgressHandle
     onProgress?.({ phase: 'phone-to-app', done: Math.min(toUpsert.length, i + BULK * INSERT_CONC), total: toUpsert.length, message: `수정 반영... ${Math.min(toUpsert.length, i + BULK * INSERT_CONC)}/${toUpsert.length}` });
   }
 
-  // Bulk soft delete — one request with IN clause
+  // Bulk soft delete — 본인 소유만. 공유받은 메인 row는 RLS에서 어차피 차단되지만
+  // 명시적으로 user_id 필터 걸어서 안전.
   const phoneIds = new Set<string>(phoneContacts.map(p => p.id ?? '').filter(Boolean));
-  const toSoftDeleteIds = serverContacts.filter(c => c.phone_contact_id && !phoneIds.has(c.phone_contact_id)).map(c => c.id);
+  const toSoftDeleteIds = serverContacts
+    .filter(c => c.user_id === userId && c.phone_contact_id && !phoneIds.has(c.phone_contact_id))
+    .map(c => c.id);
   let softDeleted = 0;
   if (toSoftDeleteIds.length) {
     for (let i = 0; i < toSoftDeleteIds.length; i += 1000) {
@@ -520,6 +523,7 @@ export async function syncPhoneToApp(userId: string, onProgress?: ProgressHandle
       const { error } = await supabase
         .from('contacts')
         .update({ deleted_at: new Date().toISOString() })
+        .eq('user_id', userId)
         .in('id', slice);
       if (!error) softDeleted += slice.length;
       else console.warn('[bulk soft-delete]', error.message);
