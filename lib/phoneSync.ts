@@ -338,18 +338,19 @@ function phoneToServerPayload(p: PhoneContact, userId: string): Partial<Contact>
 }
 
 function phoneDataMatches(server: Contact, phone: PhoneContact): boolean {
-  const normalize = (s: string | undefined | null) => (s ?? '').replace(/\D/g, '');
   const serverFirst = (server.first_name ?? '').trim();
   const serverLast = (server.last_name ?? '').trim();
   const phoneFirst = (phone.firstName ?? '').trim();
   const phoneLast = (phone.lastName ?? '').trim();
-  const serverPhone = normalize(server.phone);
-  const phoneFirstNumber = normalize(phone.phoneNumbers?.[0]?.number);
-  return (
-    serverFirst === phoneFirst &&
-    serverLast === phoneLast &&
-    serverPhone === phoneFirstNumber
-  );
+  if (serverFirst !== phoneFirst || serverLast !== phoneLast) return false;
+
+  const phoneKeySet = new Set<string>();
+  for (const n of phone.phoneNumbers ?? []) {
+    const k = phoneKey(n.number ?? '');
+    if (k) phoneKeySet.add(k);
+  }
+  const serverKeys = [phoneKey(server.phone), phoneKey(server.phone2)].filter(Boolean);
+  return serverKeys.some(k => phoneKeySet.has(k));
 }
 
 export async function syncAppToPhone(userId: string, onProgress?: ProgressHandler): Promise<{ added: number; updated: number; skipped: number; errors: number }> {
@@ -643,6 +644,19 @@ export async function syncPhoneToApp(userId: string, onProgress?: ProgressHandle
       const payload = phoneToServerPayload(p, userId);
 
       if (existing) {
+        // 이름 충돌 감지: 폰도 서버도 이름이 있는데 서로 다르면 → 덮지 않고 새 row로 insert.
+        // 이유: 웹에서 정리한 이름이 날아가는 걸 막고, 양쪽 이름을 중복정리 UI에서 사용자가 직접 선택하도록.
+        const existingFirst = (existing.first_name ?? '').trim();
+        const existingLast = (existing.last_name ?? '').trim();
+        const phoneFirst = (p.firstName ?? '').trim();
+        const phoneLast = (p.lastName ?? '').trim();
+        const bothHaveName = (existingFirst || existingLast) && (phoneFirst || phoneLast);
+        const nameDiffers = existingFirst !== phoneFirst || existingLast !== phoneLast;
+        if (bothHaveName && nameDiffers) {
+          toInsert.push(payload);
+          continue;
+        }
+
         const updates: Record<string, unknown> = { id: existing.id };
         let changed = false;
         if (existing.phone_contact_id !== p.id) { updates.phone_contact_id = p.id; changed = true; }
@@ -651,6 +665,10 @@ export async function syncPhoneToApp(userId: string, onProgress?: ProgressHandle
         for (const f of fields) {
           const newVal = payloadRec[f] ?? null;
           const oldVal = existingRec[f] ?? null;
+          // 가드 1: 폰이 빈 값이면 서버의 채워진 값을 보호
+          if ((newVal === null || newVal === '') && oldVal) continue;
+          // 가드 2: 이름은 서버 값이 있으면 절대 덮지 않음 (웹이 이름의 신뢰 출처)
+          if ((f === 'first_name' || f === 'last_name') && oldVal) continue;
           if (newVal !== oldVal) {
             updates[f] = newVal;
             changed = true;

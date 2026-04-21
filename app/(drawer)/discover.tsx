@@ -1,9 +1,11 @@
-import { useCallback, useState } from 'react';
-import { View, Text, Pressable, StyleSheet, ActivityIndicator, Alert, FlatList } from 'react-native';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { View, Text, Pressable, StyleSheet, ActivityIndicator, Alert, FlatList, Linking } from 'react-native';
 import { FontAwesome } from '@expo/vector-icons';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Contacts from 'expo-contacts';
 import { useAuth } from '@/contexts/AuthContext';
 import { supabase } from '@/lib/supabase';
+import { MAIN_USER_ID } from '@/lib/constants';
 import { phoneKey, ensurePermission as ensureContactPermission } from '@/lib/phoneSync';
 import {
   getCallLog,
@@ -24,23 +26,104 @@ import {
 
 const CLEANUP_GROUP_NAME = '정리필요';
 const CLEANUP_GROUP_COLOR = '#f59e0b';
+const DISCOVER_STATE_KEY = 'discover:state:v1';
+
+function isMobileNumber(raw: string | undefined | null): boolean {
+  if (!raw) return false;
+  let digits = raw.replace(/\D/g, '');
+  if (digits.startsWith('82')) digits = '0' + digits.slice(2);
+  return digits.length === 11 && digits.startsWith('010');
+}
+
+function formatRelative(ts: number): string {
+  const diff = Date.now() - ts;
+  const m = Math.floor(diff / 60_000);
+  if (m < 1) return '방금';
+  if (m < 60) return `${m}분 전`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}시간 전`;
+  const d = Math.floor(h / 24);
+  if (d < 30) return `${d}일 전`;
+  return new Date(ts).toLocaleDateString('ko-KR');
+}
+
+interface DiscoverState {
+  lastScanAt: number | null;
+  seen: Record<string, number>;
+  added: Record<string, number>;
+}
 
 interface UnknownNumber {
   number: string;
   normalizedKey: string;
   label: string | null;
   lastSeen: number;
+  lastSource: 'call' | 'sms';
   sources: { call: number; sms: number };
   sampleSms?: string;
+  firstSeenInScanAt?: number;
+  previouslyAddedAt?: number;
 }
 
 export default function DiscoverScreen() {
-  const { user } = useAuth();
+  const { user, isMainAccount } = useAuth();
   const [loading, setLoading] = useState(false);
   const [unknown, setUnknown] = useState<UnknownNumber[] | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
   const [stats, setStats] = useState<{ callLogs: number; sms: number; phoneContacts: number } | null>(null);
   const [busy, setBusy] = useState(false);
   const [lastAddedResult, setLastAddedResult] = useState<string | null>(null);
+  const [history, setHistory] = useState<DiscoverState>({ lastScanAt: null, seen: {}, added: {} });
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const raw = await AsyncStorage.getItem(DISCOVER_STATE_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw) as Partial<DiscoverState>;
+          setHistory({
+            lastScanAt: parsed.lastScanAt ?? null,
+            seen: parsed.seen ?? {},
+            added: parsed.added ?? {},
+          });
+        }
+      } catch (e) {
+        console.warn('[discover load state]', (e as Error).message);
+      }
+    })();
+  }, []);
+
+  const persistHistory = useCallback(async (next: DiscoverState) => {
+    setHistory(next);
+    try {
+      await AsyncStorage.setItem(DISCOVER_STATE_KEY, JSON.stringify(next));
+    } catch (e) {
+      console.warn('[discover persist]', (e as Error).message);
+    }
+  }, []);
+
+  const selectedCount = selected.size;
+  const allSelected = useMemo(
+    () => (unknown?.length ?? 0) > 0 && selectedCount === (unknown?.length ?? 0),
+    [unknown, selectedCount],
+  );
+
+  const toggleOne = useCallback((key: string) => {
+    setSelected(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+
+  const toggleAll = useCallback(() => {
+    setSelected(prev => {
+      if (!unknown) return prev;
+      if (prev.size === unknown.length) return new Set();
+      return new Set(unknown.map(u => u.normalizedKey));
+    });
+  }, [unknown]);
 
   const scan = useCallback(async () => {
     if (!isPhoneHistoryAvailable()) {
@@ -49,6 +132,7 @@ export default function DiscoverScreen() {
     }
     setLoading(true);
     setUnknown(null);
+    setSelected(new Set());
     setStats(null);
     setLastAddedResult(null);
     try {
@@ -88,6 +172,7 @@ export default function DiscoverScreen() {
       const map = new Map<string, UnknownNumber>();
 
       for (const c of callLogs) {
+        if (!isMobileNumber(c.number)) continue;
         const k = phoneKey(c.number);
         if (!k || knownKeys.has(k)) continue;
         const ex = map.get(k);
@@ -95,6 +180,7 @@ export default function DiscoverScreen() {
           ex.sources.call += 1;
           if (c.timestamp > ex.lastSeen) {
             ex.lastSeen = c.timestamp;
+            ex.lastSource = 'call';
             if (c.name) ex.label = c.name;
           }
         } else {
@@ -103,12 +189,14 @@ export default function DiscoverScreen() {
             normalizedKey: k,
             label: c.name || null,
             lastSeen: c.timestamp,
+            lastSource: 'call',
             sources: { call: 1, sms: 0 },
           });
         }
       }
 
       for (const s of sms) {
+        if (!isMobileNumber(s.number)) continue;
         const k = phoneKey(s.number);
         if (!k || knownKeys.has(k)) continue;
         const ex = map.get(k);
@@ -116,6 +204,7 @@ export default function DiscoverScreen() {
           ex.sources.sms += 1;
           if (s.timestamp > ex.lastSeen) {
             ex.lastSeen = s.timestamp;
+            ex.lastSource = 'sms';
             ex.sampleSms = s.body.slice(0, 60);
           }
           if (!ex.sampleSms && s.body) ex.sampleSms = s.body.slice(0, 60);
@@ -125,31 +214,55 @@ export default function DiscoverScreen() {
             normalizedKey: k,
             label: null,
             lastSeen: s.timestamp,
+            lastSource: 'sms',
             sources: { call: 0, sms: 1 },
             sampleSms: s.body.slice(0, 60),
           });
         }
       }
 
-      const list = [...map.values()].sort((a, b) => b.lastSeen - a.lastSeen);
+      const now = Date.now();
+      const enriched = [...map.values()].map(u => ({
+        ...u,
+        firstSeenInScanAt: history.seen[u.normalizedKey],
+        previouslyAddedAt: history.added[u.normalizedKey],
+      }));
+      enriched.sort((a, b) => b.lastSeen - a.lastSeen);
       setStats({
         callLogs: callLogs.length,
         sms: sms.length,
         phoneContacts: phoneContactsResult.data?.length ?? 0,
       });
-      setUnknown(list);
+      setUnknown(enriched);
+      const defaultSelected = enriched.filter(u => !u.firstSeenInScanAt && !u.previouslyAddedAt);
+      setSelected(new Set(defaultSelected.map(u => u.normalizedKey)));
+
+      const nextSeen = { ...history.seen };
+      for (const u of enriched) {
+        if (!nextSeen[u.normalizedKey]) nextSeen[u.normalizedKey] = now;
+      }
+      await persistHistory({
+        lastScanAt: now,
+        seen: nextSeen,
+        added: history.added,
+      });
     } catch (e) {
       Alert.alert('스캔 실패', (e as Error).message);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [history, persistHistory]);
 
-  const addAll = async () => {
+  const addSelected = async () => {
     if (!user || !unknown || unknown.length === 0) return;
+    const targets = unknown.filter(u => selected.has(u.normalizedKey));
+    if (targets.length === 0) {
+      Alert.alert('선택 없음', '추가할 번호를 먼저 선택해 주세요.');
+      return;
+    }
     Alert.alert(
       '연락처 추가',
-      `${unknown.length}개 번호를 폰과 서버에 연락처로 추가합니다. 진행할까요?`,
+      `${targets.length}개 번호를 폰과 서버에 연락처로 추가합니다. 진행할까요?`,
       [
         { text: '취소', style: 'cancel' },
         {
@@ -157,6 +270,8 @@ export default function DiscoverScreen() {
           onPress: async () => {
             setBusy(true);
             setLastAddedResult(null);
+            // 서브 계정이면 메인 계정의 연락처 공간에 insert (서버 통합 관리 정책)
+            const targetServerUserId = isMainAccount ? user.id : MAIN_USER_ID;
             try {
               // 0. "정리필요" 그룹 ensure (서버 + 폰)
               let serverGroupId: string | null = null;
@@ -165,7 +280,7 @@ export default function DiscoverScreen() {
                 const { data: existing } = await supabase
                   .from('groups')
                   .select('id, phone_group_id')
-                  .eq('user_id', user.id)
+                  .eq('user_id', targetServerUserId)
                   .eq('name', CLEANUP_GROUP_NAME)
                   .is('deleted_at', null)
                   .maybeSingle();
@@ -175,7 +290,7 @@ export default function DiscoverScreen() {
                 } else {
                   const { data: newGroup } = await supabase
                     .from('groups')
-                    .insert({ user_id: user.id, name: CLEANUP_GROUP_NAME, color: CLEANUP_GROUP_COLOR })
+                    .insert({ user_id: targetServerUserId, name: CLEANUP_GROUP_NAME, color: CLEANUP_GROUP_COLOR })
                     .select('id')
                     .single();
                   if (newGroup) serverGroupId = newGroup.id as string;
@@ -205,8 +320,8 @@ export default function DiscoverScreen() {
               let phoneAdded = 0;
               const phoneIds: string[] = [];
               if (isBatchAvailable()) {
-                for (let i = 0; i < unknown.length; i += BATCH) {
-                  const slice = unknown.slice(i, i + BATCH);
+                for (let i = 0; i < targets.length; i += BATCH) {
+                  const slice = targets.slice(i, i + BATCH);
                   const payload: BatchContact[] = slice.map(u => ({
                     firstName: u.label ?? '',
                     lastName: '',
@@ -230,7 +345,7 @@ export default function DiscoverScreen() {
                   }
                 }
               } else {
-                for (const u of unknown) {
+                for (const u of targets) {
                   try {
                     const id = await Contacts.addContactAsync({
                       contactType: Contacts.ContactTypes.Person,
@@ -246,9 +361,9 @@ export default function DiscoverScreen() {
                 }
               }
 
-              // 2. 서버에 bulk insert (id 반환받음)
-              const serverRows = unknown.map((u, i) => ({
-                user_id: user.id,
+              // 2. 서버에 bulk insert (id 반환받음). 서브 계정이면 메인 user_id로 저장.
+              const serverRows = targets.map((u, i) => ({
+                user_id: targetServerUserId,
                 first_name: u.label ?? '',
                 last_name: '',
                 phone: u.number,
@@ -281,7 +396,14 @@ export default function DiscoverScreen() {
               setLastAddedResult(
                 `완료: 폰 +${phoneAdded} / 서버 +${serverAdded} / 그룹 '${CLEANUP_GROUP_NAME}'에 ${newContactIds.length}개 추가`
               );
-              setUnknown([]);
+              const addedKeys = new Set(targets.map(t => t.normalizedKey));
+              setUnknown(prev => (prev ?? []).filter(u => !addedKeys.has(u.normalizedKey)));
+              setSelected(new Set());
+
+              const nowTs = Date.now();
+              const nextAdded = { ...history.added };
+              for (const k of addedKeys) nextAdded[k] = nowTs;
+              await persistHistory({ ...history, added: nextAdded });
             } catch (e) {
               Alert.alert('실패', (e as Error).message);
             } finally {
@@ -293,16 +415,78 @@ export default function DiscoverScreen() {
     );
   };
 
+  const openSource = useCallback(async (item: UnknownNumber, kind: 'call' | 'sms') => {
+    const tel = item.number.replace(/\s/g, '');
+    const url = kind === 'sms' ? `sms:${tel}` : `tel:${tel}`;
+    try {
+      await Linking.openURL(url);
+    } catch (e) {
+      Alert.alert('열기 실패', (e as Error).message);
+    }
+  }, []);
+
   const renderRow = ({ item }: { item: UnknownNumber }) => {
     const d = new Date(item.lastSeen);
+    const checked = selected.has(item.normalizedKey);
+    const hasCall = item.sources.call > 0;
+    const hasSms = item.sources.sms > 0;
     return (
       <View style={styles.row}>
-        <View style={{ flex: 1 }}>
-          <Text style={styles.rowNumber}>{item.label ? `${item.label} (${item.number})` : item.number}</Text>
+        <Pressable onPress={() => toggleOne(item.normalizedKey)} hitSlop={8} style={{ paddingRight: 12 }}>
+          <FontAwesome
+            name={checked ? 'check-square' : 'square-o'}
+            size={22}
+            color={checked ? '#6366f1' : '#9ca3af'}
+          />
+        </Pressable>
+        <Pressable
+          style={({ pressed }) => [{ flex: 1 }, pressed && { opacity: 0.6 }]}
+          onPress={() => openSource(item, item.lastSource)}
+        >
+          <View style={styles.rowHeader}>
+            <FontAwesome
+              name={item.lastSource === 'sms' ? 'comment' : 'phone'}
+              size={13}
+              color={item.lastSource === 'sms' ? '#10b981' : '#6366f1'}
+              style={{ marginRight: 6 }}
+            />
+            <Text style={styles.rowNumber} numberOfLines={1}>
+              {item.label ? `${item.label} (${item.number})` : item.number}
+            </Text>
+            {item.previouslyAddedAt ? (
+              <View style={[styles.badge, styles.badgeAdded]}>
+                <Text style={styles.badgeText}>이미 추가함 · {formatRelative(item.previouslyAddedAt)}</Text>
+              </View>
+            ) : item.firstSeenInScanAt ? (
+              <View style={[styles.badge, styles.badgeSeen]}>
+                <Text style={styles.badgeText}>이전 스캔 · {formatRelative(item.firstSeenInScanAt)}</Text>
+              </View>
+            ) : (
+              <View style={[styles.badge, styles.badgeNew]}>
+                <Text style={[styles.badgeText, { color: '#fff' }]}>NEW</Text>
+              </View>
+            )}
+          </View>
           <Text style={styles.rowMeta}>
-            📞 {item.sources.call}회 · ✉ {item.sources.sms}건 · 최근 {d.toLocaleDateString('ko-KR')} {d.toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' })}
+            {hasCall ? `📞 ${item.sources.call}회` : ''}
+            {hasCall && hasSms ? ' · ' : ''}
+            {hasSms ? `💬 ${item.sources.sms}건` : ''}
+            {' · '}
+            최근 {d.toLocaleDateString('ko-KR')} {d.toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' })}
           </Text>
           {item.sampleSms ? <Text style={styles.rowSms} numberOfLines={1}>{item.sampleSms}</Text> : null}
+        </Pressable>
+        <View style={styles.rowActions}>
+          {hasCall ? (
+            <Pressable onPress={() => openSource(item, 'call')} hitSlop={6} style={styles.actionBtn}>
+              <FontAwesome name="phone" size={16} color="#6366f1" />
+            </Pressable>
+          ) : null}
+          {hasSms ? (
+            <Pressable onPress={() => openSource(item, 'sms')} hitSlop={6} style={styles.actionBtn}>
+              <FontAwesome name="comment" size={16} color="#10b981" />
+            </Pressable>
+          ) : null}
         </View>
       </View>
     );
@@ -323,8 +507,13 @@ export default function DiscoverScreen() {
       <View style={{ padding: 16 }}>
         <Text style={styles.title}>통화/문자에서 연락처 찾기</Text>
         <Text style={styles.subtitle}>
-          최근 통화기록·문자 발·수신 번호 중 연락처에 저장 안 된 것만 찾아서 일괄 추가합니다.
+          010으로 시작하는 휴대폰 번호 중 연락처에 저장 안 된 것만 찾습니다. 추가할 번호를 선택하세요.
         </Text>
+        {history.lastScanAt ? (
+          <Text style={styles.lastScan}>
+            마지막 스캔: {formatRelative(history.lastScanAt)} · 누적 {Object.keys(history.seen).length}개 발견 · 추가 {Object.keys(history.added).length}개
+          </Text>
+        ) : null}
 
         {stats ? (
           <View style={styles.statsCard}>
@@ -356,16 +545,32 @@ export default function DiscoverScreen() {
         </Pressable>
 
         {unknown && unknown.length > 0 ? (
-          <Pressable style={[styles.addBtn, busy && styles.btnDisabled]} onPress={addAll} disabled={busy || loading}>
-            {busy ? (
-              <ActivityIndicator color="#fff" size="small" />
-            ) : (
-              <>
-                <FontAwesome name="user-plus" size={16} color="#fff" />
-                <Text style={styles.primaryBtnText}>{unknown.length}개 전부 연락처로 추가</Text>
-              </>
-            )}
-          </Pressable>
+          <>
+            <View style={styles.selectBar}>
+              <Text style={styles.selectText}>
+                {selectedCount} / {unknown.length} 선택됨
+              </Text>
+              <Pressable onPress={toggleAll} hitSlop={8}>
+                <Text style={styles.selectToggle}>{allSelected ? '전체해제' : '전체선택'}</Text>
+              </Pressable>
+            </View>
+            <Pressable
+              style={[styles.addBtn, (busy || selectedCount === 0) && styles.btnDisabled]}
+              onPress={addSelected}
+              disabled={busy || loading || selectedCount === 0}
+            >
+              {busy ? (
+                <ActivityIndicator color="#fff" size="small" />
+              ) : (
+                <>
+                  <FontAwesome name="user-plus" size={16} color="#fff" />
+                  <Text style={styles.primaryBtnText}>
+                    {selectedCount > 0 ? `${selectedCount}개 연락처로 추가` : '추가할 번호 선택'}
+                  </Text>
+                </>
+              )}
+            </Pressable>
+          </>
         ) : null}
       </View>
 
@@ -398,8 +603,20 @@ const styles = StyleSheet.create({
   primaryBtnText: { color: '#fff', fontSize: 14, fontWeight: '600' },
   addBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: '#10b981', borderRadius: 12, padding: 14, marginTop: 10 },
   btnDisabled: { opacity: 0.6 },
-  row: { padding: 14, borderBottomWidth: 1, borderBottomColor: '#f3f4f6', backgroundColor: '#fff' },
-  rowNumber: { fontSize: 14, color: '#111827', fontWeight: '500' },
+  lastScan: { fontSize: 11, color: '#9ca3af', marginBottom: 10, marginTop: -4 },
+  row: { flexDirection: 'row', alignItems: 'center', padding: 14, borderBottomWidth: 1, borderBottomColor: '#f3f4f6', backgroundColor: '#fff' },
+  rowHeader: { flexDirection: 'row', alignItems: 'center' },
+  badge: { paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4, marginLeft: 6 },
+  badgeText: { fontSize: 10, fontWeight: '600', color: '#374151' },
+  badgeNew: { backgroundColor: '#6366f1' },
+  badgeSeen: { backgroundColor: '#fef3c7' },
+  badgeAdded: { backgroundColor: '#d1fae5' },
+  rowActions: { flexDirection: 'row', marginLeft: 8, gap: 4 },
+  actionBtn: { width: 36, height: 36, borderRadius: 18, alignItems: 'center', justifyContent: 'center', backgroundColor: '#f3f4f6' },
+  selectBar: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 4, marginTop: 12 },
+  selectText: { fontSize: 13, color: '#6b7280' },
+  selectToggle: { fontSize: 13, color: '#6366f1', fontWeight: '600' },
+  rowNumber: { fontSize: 14, color: '#111827', fontWeight: '500', flexShrink: 1 },
   rowMeta: { fontSize: 11, color: '#6b7280', marginTop: 4 },
   rowSms: { fontSize: 11, color: '#9ca3af', marginTop: 3, fontStyle: 'italic' },
   errorTitle: { fontSize: 15, color: '#111827', fontWeight: '600' },

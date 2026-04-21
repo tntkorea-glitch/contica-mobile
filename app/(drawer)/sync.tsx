@@ -12,7 +12,7 @@ import {
 } from '@/lib/phoneSync';
 
 export default function SyncScreen() {
-  const { user } = useAuth();
+  const { user, isMainAccount } = useAuth();
   const [permission, setPermission] = useState<'unknown' | 'granted' | 'denied'>('unknown');
   const [stats, setStats] = useState<SyncStats | null>(null);
   const [statsLoading, setStatsLoading] = useState(false);
@@ -139,10 +139,19 @@ export default function SyncScreen() {
             </View>
           ) : null}
 
-          <Pressable style={[styles.primaryBtn, busy && styles.btnDisabled]} onPress={runTwoWay} disabled={busy || !stats}>
-            <FontAwesome name="exchange" size={18} color="#fff" />
-            <Text style={styles.primaryBtnText}>양방향 동기화 시작</Text>
-          </Pressable>
+          {isMainAccount ? (
+            <Pressable style={[styles.primaryBtn, busy && styles.btnDisabled]} onPress={runTwoWay} disabled={busy || !stats}>
+              <FontAwesome name="exchange" size={18} color="#fff" />
+              <Text style={styles.primaryBtnText}>양방향 동기화 시작</Text>
+            </Pressable>
+          ) : (
+            <View style={styles.subInfoCard}>
+              <FontAwesome name="info-circle" size={16} color="#92400e" />
+              <Text style={styles.subInfoText}>
+                이 계정은 <Text style={{ fontWeight: '700' }}>서브 계정</Text>입니다. 메인 계정(웹)의 연락처를 폰으로 받아오기만 지원하며, 폰에서의 수정/삭제는 서버에 자동 반영되지 않습니다.
+              </Text>
+            </View>
+          )}
 
           <Pressable
             style={[styles.altActionBtn, busy && styles.btnDisabled]}
@@ -180,7 +189,9 @@ export default function SyncScreen() {
 
           <Text style={styles.note}>
             💡 앱이 열려있는 동안은 서버 변경이 폰에 자동 반영됩니다.{'\n'}
-            폰에서 추가/수정한 내용은 앱을 포그라운드로 전환할 때마다 자동 감지되어 서버로 올라갑니다.
+            {isMainAccount
+              ? '폰에서 추가/수정한 내용은 앱을 포그라운드로 전환할 때마다 자동 감지되어 서버로 올라갑니다.'
+              : '서브 계정이므로 폰에서 변경한 내용은 서버로 올라가지 않습니다. Discover 탭에서 찾은 신규 번호는 메인 계정 서버에 추가됩니다.'}
           </Text>
         </>
       )}
@@ -226,4 +237,6 @@ const styles = StyleSheet.create({
   errorText: { fontSize: 13, color: '#991b1b', textAlign: 'center' },
   secondaryBtn: { paddingHorizontal: 16, paddingVertical: 8, backgroundColor: '#fff', borderRadius: 8, borderWidth: 1, borderColor: '#fca5a5' },
   secondaryBtnText: { color: '#991b1b', fontSize: 13, fontWeight: '600' },
+  subInfoCard: { flexDirection: 'row', alignItems: 'flex-start', gap: 10, backgroundColor: '#fef3c7', borderRadius: 12, padding: 14, marginBottom: 10 },
+  subInfoText: { fontSize: 13, color: '#92400e', flex: 1, lineHeight: 19 },
 });
